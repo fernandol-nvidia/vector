@@ -293,13 +293,12 @@ impl SinkConfig for AzureBlobSinkConfig {
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
-        match self
+        if let Err(e) = self
             .blob_prefix
             .clone()
             .confine(&self.confinement, Self::NAME, "blob_prefix")
         {
-            Ok(_) => {}
-            Err(e) => errors.push(e.to_string()),
+            errors.push(e.to_string());
         }
 
         if errors.is_empty() {

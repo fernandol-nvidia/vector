@@ -259,22 +259,20 @@ impl SinkConfig for DorisConfig {
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
-        match self
+        if let Err(e) = self
             .database
             .clone()
             .confine(&self.confinement, Self::NAME, "database")
         {
-            Ok(_) => {}
-            Err(e) => errors.push(e.to_string()),
+            errors.push(e.to_string());
         }
 
-        match self
+        if let Err(e) = self
             .table
             .clone()
             .confine(&self.confinement, Self::NAME, "table")
         {
-            Ok(_) => {}
-            Err(e) => errors.push(e.to_string()),
+            errors.push(e.to_string());
         }
 
         if errors.is_empty() {

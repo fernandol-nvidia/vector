@@ -298,21 +298,19 @@ impl SinkConfig for ClickhouseConfig {
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
-        match self
+        if let Err(e) = self
             .table
             .clone()
             .confine(&self.confinement, Self::NAME, "table")
         {
-            Ok(_) => {}
-            Err(e) => errors.push(e.to_string()),
+            errors.push(e.to_string());
         }
 
         let database_template = self.database.clone().unwrap_or_else(|| {
             Template::try_from("default").expect("default database template is valid")
         });
-        match database_template.confine(&self.confinement, Self::NAME, "database") {
-            Ok(_) => {}
-            Err(e) => errors.push(e.to_string()),
+        if let Err(e) = database_template.confine(&self.confinement, Self::NAME, "database") {
+            errors.push(e.to_string());
         }
 
         if errors.is_empty() {

@@ -281,6 +281,18 @@ impl SinkConfig for HttpSinkConfig {
             errors.push(e.to_string());
         }
 
+        // Validate static URIs can be parsed
+        if !self.uri.is_dynamic()
+            && let Err(e) = self.uri.get_ref().parse::<http::Uri>()
+        {
+            errors.push(format!("uri: invalid URI: {e}"));
+        }
+
+        // Validate headers (both static and template values)
+        if let Err(e) = validate_headers(&self.request.headers, self.auth.is_some()) {
+            errors.push(format!("request.headers: {e}"));
+        }
+
         // Validate header value templates confinement
         // split_headers() returns (static_headers, template_headers)
         let (_, template_headers) = self.request.split_headers();
@@ -446,8 +458,10 @@ impl HttpSinkConfig {
 #[cfg(test)]
 mod tests {
     use vector_lib::codecs::encoding::format::JsonSerializerOptions;
+    use vector_lib::codecs::{JsonSerializerConfig, MetricTagValues};
 
     use super::*;
+    use crate::codecs::Transformer;
     use crate::components::validation::prelude::*;
     use crate::template::{ConfinementConfig, Template};
 
@@ -547,5 +561,139 @@ mod tests {
             .as_mut_log()
             .insert(event_path!("tenant"), "../../evil.com/steal?data=");
         assert!(template.render_string(&event).is_err());
+    }
+
+    #[test]
+    fn validate_structure_rejects_invalid_static_uri() {
+        // Use a URI with invalid characters that http::Uri will reject
+        let config = HttpSinkConfig {
+            uri: Template::try_from("http://").unwrap(),
+            method: HttpMethod::default(),
+            encoding: EncodingConfigWithFraming::new(
+                None,
+                JsonSerializerConfig::new(MetricTagValues::Full, JsonSerializerOptions::default())
+                    .into(),
+                Transformer::default(),
+            ),
+            auth: None,
+            compression: Compression::default(),
+            batch: BatchConfig::default(),
+            request: RequestConfig::default(),
+            tls: None,
+            acknowledgements: AcknowledgementsConfig::default(),
+            payload_prefix: String::new(),
+            payload_suffix: String::new(),
+            retry_strategy: RetryStrategy::default(),
+            confinement: ConfinementConfig::default(),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("invalid URI")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_allows_valid_static_uri() {
+        let config = HttpSinkConfig {
+            uri: Template::try_from("https://example.com/endpoint").unwrap(),
+            method: HttpMethod::default(),
+            encoding: EncodingConfigWithFraming::new(
+                None,
+                JsonSerializerConfig::new(MetricTagValues::Full, JsonSerializerOptions::default())
+                    .into(),
+                Transformer::default(),
+            ),
+            auth: None,
+            compression: Compression::default(),
+            batch: BatchConfig::default(),
+            request: RequestConfig::default(),
+            tls: None,
+            acknowledgements: AcknowledgementsConfig::default(),
+            payload_prefix: String::new(),
+            payload_suffix: String::new(),
+            retry_strategy: RetryStrategy::default(),
+            confinement: ConfinementConfig::default(),
+        };
+
+        config.validate_structure().unwrap();
+    }
+
+    #[test]
+    fn validate_structure_rejects_malformed_headers() {
+        let mut headers = BTreeMap::new();
+        headers.insert("Invalid-Header-Name\n".to_string(), "value".to_string());
+
+        let config = HttpSinkConfig {
+            uri: Template::try_from("https://example.com").unwrap(),
+            method: HttpMethod::default(),
+            encoding: EncodingConfigWithFraming::new(
+                None,
+                JsonSerializerConfig::new(MetricTagValues::Full, JsonSerializerOptions::default())
+                    .into(),
+                Transformer::default(),
+            ),
+            auth: None,
+            compression: Compression::default(),
+            batch: BatchConfig::default(),
+            request: RequestConfig {
+                headers,
+                ..Default::default()
+            },
+            tls: None,
+            acknowledgements: AcknowledgementsConfig::default(),
+            payload_prefix: String::new(),
+            payload_suffix: String::new(),
+            retry_strategy: RetryStrategy::default(),
+            confinement: ConfinementConfig::default(),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("headers")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_auth_header_with_auth_config() {
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".to_string(), "Bearer token".to_string());
+
+        let config = HttpSinkConfig {
+            uri: Template::try_from("https://example.com").unwrap(),
+            method: HttpMethod::default(),
+            encoding: EncodingConfigWithFraming::new(
+                None,
+                JsonSerializerConfig::new(MetricTagValues::Full, JsonSerializerOptions::default())
+                    .into(),
+                Transformer::default(),
+            ),
+            auth: Some(crate::http::Auth::Bearer {
+                token: "test".to_string().into(),
+            }),
+            compression: Compression::default(),
+            batch: BatchConfig::default(),
+            request: RequestConfig {
+                headers,
+                ..Default::default()
+            },
+            tls: None,
+            acknowledgements: AcknowledgementsConfig::default(),
+            payload_prefix: String::new(),
+            payload_suffix: String::new(),
+            retry_strategy: RetryStrategy::default(),
+            confinement: ConfinementConfig::default(),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("Authorization")),
+            "unexpected errors: {:?}",
+            errors
+        );
     }
 }

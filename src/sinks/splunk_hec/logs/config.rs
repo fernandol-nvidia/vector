@@ -253,6 +253,12 @@ impl SinkConfig for HecLogsSinkConfig {
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
+        // Validate raw endpoint incompatibility with auto_extract_timestamp
+        if self.auto_extract_timestamp.is_some() && self.endpoint_target == EndpointTarget::Raw {
+            errors
+                .push("`auto_extract_timestamp` cannot be set for the `raw` endpoint.".to_string());
+        }
+
         if let Some(index) = self.index.clone()
             && let Err(e) = index.confine(&self.confinement, Self::NAME, "index")
         {
@@ -395,6 +401,68 @@ mod tests {
         let config = ConfinementConfig::default();
         let result = template.confine(&config, "splunk_hec_logs", "index");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_structure_rejects_raw_endpoint_with_auto_extract_timestamp() {
+        use crate::config::SinkConfig;
+
+        let config = HecLogsSinkConfig {
+            default_token: SensitiveString::from("test-token".to_string()),
+            endpoint: "http://localhost:8088".to_string(),
+            host_key: None,
+            indexed_fields: vec![],
+            index: None,
+            sourcetype: None,
+            source: None,
+            encoding: TextSerializerConfig::default().into(),
+            compression: Compression::default(),
+            batch: BatchConfig::default(),
+            request: TowerRequestConfig::default(),
+            tls: None,
+            acknowledgements: Default::default(),
+            timestamp_nanos_key: None,
+            timestamp_key: None,
+            auto_extract_timestamp: Some(true),
+            endpoint_target: EndpointTarget::Raw,
+            confinement: ConfinementConfig::default(),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("auto_extract_timestamp") && errors[0].contains("raw"),
+            "unexpected error: {:?}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn validate_structure_allows_raw_endpoint_without_auto_extract_timestamp() {
+        use crate::config::SinkConfig;
+
+        let config = HecLogsSinkConfig {
+            default_token: SensitiveString::from("test-token".to_string()),
+            endpoint: "http://localhost:8088".to_string(),
+            host_key: None,
+            indexed_fields: vec![],
+            index: None,
+            sourcetype: None,
+            source: None,
+            encoding: TextSerializerConfig::default().into(),
+            compression: Compression::default(),
+            batch: BatchConfig::default(),
+            request: TowerRequestConfig::default(),
+            tls: None,
+            acknowledgements: Default::default(),
+            timestamp_nanos_key: None,
+            timestamp_key: None,
+            auto_extract_timestamp: None,
+            endpoint_target: EndpointTarget::Raw,
+            confinement: ConfinementConfig::default(),
+        };
+
+        config.validate_structure().unwrap();
     }
 
     impl ValidatableComponent for HecLogsSinkConfig {

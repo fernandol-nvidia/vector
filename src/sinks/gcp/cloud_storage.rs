@@ -297,6 +297,8 @@ impl SinkConfig for GcsSinkConfig {
     }
 
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        use http::header::HeaderValue;
+
         let mut errors = Vec::new();
 
         match Template::try_from(self.key_prefix.as_deref().unwrap_or("date=%F/")) {
@@ -307,6 +309,33 @@ impl SinkConfig for GcsSinkConfig {
             }
             Err(e) => {
                 errors.push(format!("key_prefix: {e}"));
+            }
+        }
+
+        // Validate header values that RequestSettings::new() would reject
+        if let Some(content_type) = &self.content_type
+            && let Err(e) = HeaderValue::from_str(content_type)
+        {
+            errors.push(format!("content_type: invalid header value: {e}"));
+        }
+
+        if let Some(content_encoding) = &self.content_encoding
+            && let Err(e) = HeaderValue::from_str(content_encoding)
+        {
+            errors.push(format!("content_encoding: invalid header value: {e}"));
+        }
+
+        if let Some(cache_control) = &self.cache_control
+            && let Err(e) = HeaderValue::from_str(cache_control)
+        {
+            errors.push(format!("cache_control: invalid header value: {e}"));
+        }
+
+        if let Some(metadata) = &self.metadata {
+            for (name, value) in metadata {
+                if let Err(e) = HeaderValue::from_str(value) {
+                    errors.push(format!("metadata.{name}: invalid header value: {e}"));
+                }
             }
         }
 
@@ -857,5 +886,84 @@ mod tests {
             .as_mut_log()
             .insert(event_path!("tenant"), "../../escape");
         assert!(template.render_string(&event).is_err());
+    }
+
+    #[test]
+    fn validate_structure_rejects_invalid_content_type() {
+        let config = GcsSinkConfig {
+            content_type: Some("text/plain\nInvalid".to_string()),
+            ..default_config((None::<FramingConfig>, TextSerializerConfig::default()).into())
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("content_type")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_invalid_content_encoding() {
+        let config = GcsSinkConfig {
+            content_encoding: Some("gzip\nInvalid".to_string()),
+            ..default_config((None::<FramingConfig>, TextSerializerConfig::default()).into())
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("content_encoding")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_invalid_cache_control() {
+        let config = GcsSinkConfig {
+            cache_control: Some("no-transform\nInvalid".to_string()),
+            ..default_config((None::<FramingConfig>, TextSerializerConfig::default()).into())
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("cache_control")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_invalid_metadata_value() {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("key".to_string(), "value\nInvalid".to_string());
+
+        let config = GcsSinkConfig {
+            metadata: Some(metadata),
+            ..default_config((None::<FramingConfig>, TextSerializerConfig::default()).into())
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("metadata.key")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_allows_valid_header_fields() {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("key".to_string(), "valid-value".to_string());
+
+        let config = GcsSinkConfig {
+            content_type: Some("text/plain".to_string()),
+            content_encoding: Some("gzip".to_string()),
+            cache_control: Some("no-transform".to_string()),
+            metadata: Some(metadata),
+            ..default_config((None::<FramingConfig>, TextSerializerConfig::default()).into())
+        };
+
+        config.validate_structure().unwrap();
     }
 }

@@ -263,6 +263,18 @@ impl SinkConfig for LokiConfig {
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
+        // Check for empty labels (mirrors build() check)
+        if self.labels.is_empty() {
+            errors.push("`labels` must include at least one label.".to_string());
+        }
+
+        // Validate label names (mirrors build() check)
+        for label in self.labels.keys() {
+            if !valid_label_name(label) {
+                errors.push(format!("Invalid label name {:?}", label.get_ref()));
+            }
+        }
+
         // Validate tenant_id confinement
         if let Some(tenant_id) = self.tenant_id.clone()
             && let Err(e) = tenant_id.confine(&self.confinement, Self::NAME, "tenant_id")
@@ -383,6 +395,72 @@ mod tests {
         assert!(
             rendered.starts_with("team-"),
             "operator-controlled prefix must be preserved in rendered tenant_id"
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_empty_labels() {
+        use super::LokiConfig;
+        use crate::config::SinkConfig;
+        use crate::sinks::util::UriSerde;
+        use std::collections::HashMap;
+        use vector_lib::codecs::TextSerializerConfig;
+
+        let config = LokiConfig {
+            endpoint: "http://localhost:3100".parse::<UriSerde>().unwrap(),
+            labels: HashMap::new(),
+            encoding: TextSerializerConfig::default().into(),
+            ..toml::from_str::<LokiConfig>(
+                r#"
+endpoint = "http://localhost:3100"
+encoding.codec = "text"
+labels = {"static_label" = "static_value"}
+"#,
+            )
+            .unwrap()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("labels") && e.contains("at least one")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_invalid_label_name() {
+        use super::LokiConfig;
+        use crate::config::SinkConfig;
+        use std::collections::HashMap;
+
+        let mut labels = HashMap::new();
+        labels.insert(
+            Template::try_from("bad-label").unwrap(),
+            Template::try_from("value").unwrap(),
+        );
+
+        let label_config = toml::from_str::<LokiConfig>(
+            r#"
+endpoint = "http://localhost:3100"
+encoding.codec = "text"
+labels = {"static_label" = "static_value"}
+"#,
+        )
+        .unwrap();
+
+        let config = LokiConfig {
+            labels,
+            ..label_config
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("Invalid label name")),
+            "unexpected errors: {:?}",
+            errors
         );
     }
 }

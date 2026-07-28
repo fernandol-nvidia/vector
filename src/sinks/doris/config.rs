@@ -259,6 +259,10 @@ impl SinkConfig for DorisConfig {
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
+        if self.endpoints.is_empty() {
+            errors.push("No endpoints configured.".to_string());
+        }
+
         if let Err(e) = self
             .database
             .clone()
@@ -332,6 +336,22 @@ mod tests {
         assert!(
             result.is_err(),
             "dotdot escape in rendered value must be rejected by prefix check"
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_empty_endpoints() {
+        let config = DorisConfig {
+            endpoints: vec![],
+            ..Default::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("endpoints"),
+            "unexpected error: {:?}",
+            errors[0]
         );
     }
 }

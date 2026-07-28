@@ -294,6 +294,33 @@ impl SinkConfig for ClickhouseConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
+
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        match self
+            .table
+            .clone()
+            .confine(&self.confinement, Self::NAME, "table")
+        {
+            Ok(_) => {}
+            Err(e) => errors.push(e.to_string()),
+        }
+
+        let database_template = self.database.clone().unwrap_or_else(|| {
+            Template::try_from("default").expect("default database template is valid")
+        });
+        match database_template.confine(&self.confinement, Self::NAME, "database") {
+            Ok(_) => {}
+            Err(e) => errors.push(e.to_string()),
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 impl ClickhouseConfig {

@@ -255,6 +255,34 @@ impl SinkConfig for DorisConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
+
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        match self
+            .database
+            .clone()
+            .confine(&self.confinement, Self::NAME, "database")
+        {
+            Ok(_) => {}
+            Err(e) => errors.push(e.to_string()),
+        }
+
+        match self
+            .table
+            .clone()
+            .confine(&self.confinement, Self::NAME, "table")
+        {
+            Ok(_) => {}
+            Err(e) => errors.push(e.to_string()),
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 #[cfg(test)]

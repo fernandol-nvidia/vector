@@ -194,6 +194,22 @@ impl SinkConfig for RemoteWriteConfig {
         &self.acknowledgements
     }
 
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        if let Some(tenant_id) = self.tenant_id.clone()
+            && let Err(e) = tenant_id.confine(&self.confinement, Self::NAME, "tenant_id")
+        {
+            errors.push(e.to_string());
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let tenant_id = self
             .tenant_id

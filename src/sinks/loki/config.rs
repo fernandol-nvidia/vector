@@ -259,6 +259,43 @@ impl SinkConfig for LokiConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
+
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        // Validate tenant_id confinement
+        if let Some(tenant_id) = self.tenant_id.clone()
+            && let Err(e) = tenant_id.confine(&self.confinement, Self::NAME, "tenant_id")
+        {
+            errors.push(e.to_string());
+        }
+
+        // Validate labels confinement (both keys and values)
+        for (k, v) in self.labels.clone().into_iter() {
+            if let Err(e) = k.confine(&self.confinement, Self::NAME, "labels[key]") {
+                errors.push(e.to_string());
+            }
+            if let Err(e) = v.confine(&self.confinement, Self::NAME, "labels[value]") {
+                errors.push(e.to_string());
+            }
+        }
+
+        // Validate structured_metadata confinement (both keys and values)
+        for (k, v) in self.structured_metadata.clone().into_iter() {
+            if let Err(e) = k.confine(&self.confinement, Self::NAME, "structured_metadata[key]") {
+                errors.push(e.to_string());
+            }
+            if let Err(e) = v.confine(&self.confinement, Self::NAME, "structured_metadata[value]") {
+                errors.push(e.to_string());
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 pub fn valid_label_name(label: &Template) -> bool {

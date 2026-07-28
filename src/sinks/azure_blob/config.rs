@@ -289,6 +289,25 @@ impl SinkConfig for AzureBlobSinkConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
+
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        match self
+            .blob_prefix
+            .clone()
+            .confine(&self.confinement, Self::NAME, "blob_prefix")
+        {
+            Ok(_) => {}
+            Err(e) => errors.push(e.to_string()),
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 const DEFAULT_KEY_PREFIX: &str = "blob/%F/";

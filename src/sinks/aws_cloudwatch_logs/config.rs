@@ -258,6 +258,34 @@ impl SinkConfig for CloudwatchLogsSinkConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
+
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        match self
+            .group_name
+            .clone()
+            .confine(&self.confinement, Self::NAME, "group_name")
+        {
+            Ok(_) => {}
+            Err(e) => errors.push(e.to_string()),
+        }
+
+        match self
+            .stream_name
+            .clone()
+            .confine(&self.confinement, Self::NAME, "stream_name")
+        {
+            Ok(_) => {}
+            Err(e) => errors.push(e.to_string()),
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 impl GenerateConfig for CloudwatchLogsSinkConfig {

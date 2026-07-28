@@ -268,6 +268,34 @@ impl SinkConfig for HttpSinkConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
+
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        // Validate URI confinement
+        if let Err(e) = self
+            .uri
+            .clone()
+            .confine(&self.confinement, Self::NAME, "uri")
+        {
+            errors.push(e.to_string());
+        }
+
+        // Validate header value templates confinement
+        // split_headers() returns (static_headers, template_headers)
+        let (_, template_headers) = self.request.split_headers();
+        for (name, tpl) in template_headers.into_iter() {
+            if let Err(e) = tpl.confine(&self.confinement, Self::NAME, "request.headers") {
+                errors.push(format!("headers.{}: {}", name, e));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 impl HttpSinkConfig {

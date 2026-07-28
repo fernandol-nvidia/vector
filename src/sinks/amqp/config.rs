@@ -160,6 +160,32 @@ impl SinkConfig for AmqpSinkConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
+
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        match self
+            .exchange
+            .clone()
+            .confine(&self.confinement, Self::NAME, "exchange")
+        {
+            Ok(_) => {}
+            Err(e) => errors.push(e.to_string()),
+        }
+
+        if let Some(routing_key) = self.routing_key.clone() {
+            match routing_key.confine(&self.confinement, Self::NAME, "routing_key") {
+                Ok(_) => {}
+                Err(e) => errors.push(e.to_string()),
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 pub(super) async fn healthcheck(channels: AmqpSinkChannels) -> crate::Result<()> {

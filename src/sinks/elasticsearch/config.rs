@@ -790,6 +790,43 @@ impl SinkConfig for ElasticsearchConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
+
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        // Validate the active mode's routing templates.
+        // This mirrors the confinement logic in common_mode().
+        match self.mode {
+            ElasticsearchMode::Bulk => {
+                if let Err(e) =
+                    self.bulk
+                        .index
+                        .clone()
+                        .confine(&self.confinement, Self::NAME, "bulk.index")
+                {
+                    errors.push(e.to_string());
+                }
+            }
+            ElasticsearchMode::DataStream => {
+                if let Some(data_stream) = &self.data_stream {
+                    if let Err(e) = data_stream.clone().confine(&self.confinement, Self::NAME) {
+                        errors.push(e.to_string());
+                    }
+                } else {
+                    let default = DataStreamConfig::default();
+                    if let Err(e) = default.confine(&self.confinement, Self::NAME) {
+                        errors.push(e.to_string());
+                    }
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 #[cfg(test)]

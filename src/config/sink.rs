@@ -236,6 +236,22 @@ impl From<UriSerde> for SinkHealthcheckOptions {
 #[async_trait]
 #[typetag::serde(tag = "type")]
 pub trait SinkConfig: DynClone + NamedComponent + core::fmt::Debug + Send + Sync {
+    /// Validates structural constraints on the sink configuration that do not require
+    /// environment resources: invalid URIs, out-of-range values, duplicate keys,
+    /// template confinement checks, and similar config-level checks.
+    ///
+    /// Called during config compilation so errors are reported on both `vector validate`
+    /// and normal startup/reload. This is the first validation phase, run before any
+    /// context-dependent checks or the full build.
+    ///
+    /// # Errors
+    ///
+    /// If validation does not succeed, an error variant containing a list of all validation errors
+    /// is returned.
+    fn validate_structure(&self) -> Result<(), Vec<String>> {
+        Ok(())
+    }
+
     /// Builds the sink with the given context.
     ///
     /// If the sink is built successfully, `Ok(...)` is returned containing the sink and the sink's

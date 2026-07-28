@@ -225,6 +225,24 @@ impl SinkConfig for RedisSinkConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
+
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        if let Err(e) = self
+            .key
+            .clone()
+            .confine(&self.confinement, Self::NAME, "key")
+        {
+            errors.push(e.to_string());
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 impl RedisSinkConfig {

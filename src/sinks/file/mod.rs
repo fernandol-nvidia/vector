@@ -265,6 +265,32 @@ impl SinkConfig for FileSinkConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
+
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        // Validate base_dir is absolute if present
+        if let Some(base) = self.base_dir.as_ref()
+            && base.is_relative()
+        {
+            errors.push(format!("base_dir must be an absolute path, got {:?}", base));
+        }
+
+        // Validate path confinement (unless opted out)
+        if !self
+            .confinement
+            .dangerously_allow_unconfined_template_resolution
+            && let Err(e) = PathConfinement::for_template(&self.path, self.base_dir.as_deref())
+        {
+            errors.push(e.to_string());
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 pub struct FileSink {

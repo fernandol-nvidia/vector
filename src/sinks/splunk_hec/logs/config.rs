@@ -249,6 +249,34 @@ impl SinkConfig for HecLogsSinkConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements.inner
     }
+
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        if let Some(index) = self.index.clone()
+            && let Err(e) = index.confine(&self.confinement, Self::NAME, "index")
+        {
+            errors.push(e.to_string());
+        }
+
+        if let Some(source) = self.source.clone()
+            && let Err(e) = source.confine(&self.confinement, Self::NAME, "source")
+        {
+            errors.push(e.to_string());
+        }
+
+        if let Some(sourcetype) = self.sourcetype.clone()
+            && let Err(e) = sourcetype.confine(&self.confinement, Self::NAME, "sourcetype")
+        {
+            errors.push(e.to_string());
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 impl HecLogsSinkConfig {

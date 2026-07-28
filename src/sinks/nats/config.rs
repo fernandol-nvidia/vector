@@ -205,6 +205,24 @@ impl SinkConfig for NatsSinkConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
+
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        if let Err(e) = self
+            .subject
+            .clone()
+            .confine(&self.confinement, Self::NAME, "subject")
+        {
+            errors.push(e.to_string());
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 impl std::convert::TryFrom<&NatsSinkConfig> for async_nats::ConnectOptions {

@@ -348,6 +348,39 @@ impl SinkConfig for StackdriverConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
+
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        // Validate log_id confinement
+        if let Err(e) = self
+            .log_id
+            .clone()
+            .confine(&self.confinement, Self::NAME, "log_id")
+        {
+            errors.push(e.to_string());
+        }
+
+        // Validate resource.labels confinement
+        for (k, v) in self.resource.labels.clone().into_iter() {
+            if let Err(e) = v.confine(&self.confinement, Self::NAME, "resource.labels") {
+                errors.push(format!("resource.labels.{}: {}", k, e));
+            }
+        }
+
+        // Validate label_config.labels confinement
+        for (k, v) in self.label_config.labels.clone().into_iter() {
+            if let Err(e) = v.confine(&self.confinement, Self::NAME, "label_config.labels") {
+                errors.push(format!("labels.{}: {}", k, e));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 async fn healthcheck(client: HttpClient, auth: GcpAuthenticator, uri: Uri) -> crate::Result<()> {

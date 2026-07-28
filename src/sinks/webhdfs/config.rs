@@ -125,6 +125,29 @@ impl SinkConfig for WebHdfsConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
+
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        // Validate template confinement for prefix.
+        // This is a purely structural check that does not require environment access.
+        match Template::try_from(self.prefix.clone()) {
+            Ok(tpl) => {
+                if let Err(e) = tpl.confine(&self.confinement, Self::NAME, "prefix") {
+                    errors.push(e.to_string());
+                }
+            }
+            Err(e) => {
+                errors.push(format!("prefix: {e}"));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 impl WebHdfsConfig {

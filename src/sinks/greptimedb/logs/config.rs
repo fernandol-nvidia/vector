@@ -221,6 +221,47 @@ impl SinkConfig for GreptimeDBLogsConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
+
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        if let Err(e) = self
+            .table
+            .clone()
+            .confine(&self.confinement, Self::NAME, "table")
+        {
+            errors.push(e.to_string());
+        }
+
+        if let Err(e) = self
+            .dbname
+            .clone()
+            .confine(&self.confinement, Self::NAME, "dbname")
+        {
+            errors.push(e.to_string());
+        }
+
+        if let Err(e) =
+            self.pipeline_name
+                .clone()
+                .confine(&self.confinement, Self::NAME, "pipeline_name")
+        {
+            errors.push(e.to_string());
+        }
+
+        if let Some(pipeline_version) = self.pipeline_version.clone()
+            && let Err(e) =
+                pipeline_version.confine(&self.confinement, Self::NAME, "pipeline_version")
+        {
+            errors.push(e.to_string());
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 #[cfg(test)]

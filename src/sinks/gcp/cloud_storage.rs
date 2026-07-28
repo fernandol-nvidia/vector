@@ -295,6 +295,27 @@ impl SinkConfig for GcsSinkConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
+
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        match Template::try_from(self.key_prefix.as_deref().unwrap_or("date=%F/")) {
+            Ok(tpl) => {
+                if let Err(e) = tpl.confine(&self.confinement, Self::NAME, "key_prefix") {
+                    errors.push(e.to_string());
+                }
+            }
+            Err(e) => {
+                errors.push(format!("key_prefix: {e}"));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 impl GcsSinkConfig {

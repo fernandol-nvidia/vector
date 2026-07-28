@@ -143,6 +143,21 @@ impl SinkConfig for MqttSinkConfig {
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
+        // Check for empty client_id
+        if let Some(client_id) = &self.common.client_id
+            && client_id.is_empty()
+        {
+            errors.push("client_id cannot be empty".to_string());
+        }
+
+        // Check for invalid credentials (only one of user/password set)
+        match (&self.common.user, &self.common.password) {
+            (Some(_), None) | (None, Some(_)) => {
+                errors.push("both user and password must be set together".to_string());
+            }
+            _ => {}
+        }
+
         if let Err(e) = self
             .topic
             .clone()
@@ -247,5 +262,86 @@ mod test {
         let config = ConfinementConfig::default();
         let result = template.confine(&config, "mqtt", "topic");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_structure_rejects_empty_client_id() {
+        use crate::common::mqtt::MqttCommonConfig;
+
+        let config = MqttSinkConfig {
+            common: MqttCommonConfig {
+                client_id: Some("".to_string()),
+                ..MqttCommonConfig::default()
+            },
+            ..MqttSinkConfig::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("client_id"),
+            "unexpected error: {:?}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_user_without_password() {
+        use crate::common::mqtt::MqttCommonConfig;
+
+        let config = MqttSinkConfig {
+            common: MqttCommonConfig {
+                user: Some("user".to_string()),
+                password: None,
+                ..MqttCommonConfig::default()
+            },
+            ..MqttSinkConfig::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("user") && errors[0].contains("password"),
+            "unexpected error: {:?}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_password_without_user() {
+        use crate::common::mqtt::MqttCommonConfig;
+
+        let config = MqttSinkConfig {
+            common: MqttCommonConfig {
+                user: None,
+                password: Some("secret".to_string()),
+                ..MqttCommonConfig::default()
+            },
+            ..MqttSinkConfig::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("user") && errors[0].contains("password"),
+            "unexpected error: {:?}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn validate_structure_allows_valid_credentials() {
+        use crate::common::mqtt::MqttCommonConfig;
+
+        let config = MqttSinkConfig {
+            common: MqttCommonConfig {
+                user: Some("user".to_string()),
+                password: Some("secret".to_string()),
+                ..MqttCommonConfig::default()
+            },
+            ..MqttSinkConfig::default()
+        };
+
+        config.validate_structure().unwrap();
     }
 }

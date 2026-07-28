@@ -272,6 +272,11 @@ impl SinkConfig for HttpSinkConfig {
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
+        // Validate batch settings (max_events, max_bytes, timeout_secs)
+        if let Err(e) = self.batch.validate() {
+            errors.push(format!("batch: {e}"));
+        }
+
         // Validate URI confinement
         if let Err(e) = self
             .uri
@@ -692,6 +697,40 @@ mod tests {
         let errors = config.validate_structure().unwrap_err();
         assert!(
             errors.iter().any(|e| e.contains("Authorization")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_invalid_batch_settings() {
+        let mut batch = BatchConfig::default();
+        batch.max_events = Some(0);
+
+        let config = HttpSinkConfig {
+            uri: Template::try_from("https://example.com").unwrap(),
+            method: HttpMethod::default(),
+            encoding: EncodingConfigWithFraming::new(
+                None,
+                JsonSerializerConfig::new(MetricTagValues::Full, JsonSerializerOptions::default())
+                    .into(),
+                Transformer::default(),
+            ),
+            auth: None,
+            compression: Compression::default(),
+            batch,
+            request: RequestConfig::default(),
+            tls: None,
+            acknowledgements: AcknowledgementsConfig::default(),
+            payload_prefix: String::new(),
+            payload_suffix: String::new(),
+            retry_strategy: RetryStrategy::default(),
+            confinement: ConfinementConfig::default(),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("batch")),
             "unexpected errors: {:?}",
             errors
         );

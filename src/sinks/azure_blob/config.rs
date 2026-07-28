@@ -293,6 +293,40 @@ impl SinkConfig for AzureBlobSinkConfig {
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
+        // Mirror credential shape checks from build()
+        match (
+            &self.connection_string,
+            &self.account_name,
+            &self.blob_endpoint,
+        ) {
+            (Some(_), Some(_), _) => {
+                errors
+                    .push("Cannot provide both `connection_string` and `account_name`".to_string());
+            }
+            (Some(_), _, Some(_)) => {
+                errors.push(
+                    "Cannot provide both `connection_string` and `blob_endpoint`".to_string(),
+                );
+            }
+            (_, Some(_), Some(_)) => {
+                errors.push("Cannot provide both `account_name` and `blob_endpoint`".to_string());
+            }
+            (None, None, None) => {
+                errors.push("One of `connection_string`, `account_name`, or `blob_endpoint` must be provided".to_string());
+            }
+            (None, Some(_), None) if self.auth.is_none() => {
+                errors.push(
+                    "`auth` configuration must be provided when using `account_name`".to_string(),
+                );
+            }
+            (None, None, Some(_)) if self.auth.is_none() => {
+                errors.push(
+                    "`auth` configuration must be provided when using `blob_endpoint`".to_string(),
+                );
+            }
+            _ => {}
+        }
+
         if let Err(e) =
             self.blob_prefix
                 .clone()
@@ -409,6 +443,156 @@ mod tests {
             .as_mut_log()
             .insert(event_path!("tenant"), "../../escape");
         assert!(template.render_string(&event).is_err());
+    }
+
+    #[test]
+    fn validate_structure_rejects_no_credentials() {
+        use crate::config::SinkConfig;
+
+        let config = AzureBlobSinkConfig {
+            auth: None,
+            connection_string: None,
+            account_name: None,
+            blob_endpoint: None,
+            container_name: "logs".to_string(),
+            blob_prefix: default_blob_prefix(),
+            blob_time_format: None,
+            blob_append_uuid: None,
+            encoding: (
+                Some(NewlineDelimitedEncoderConfig::new()),
+                JsonSerializerConfig::default(),
+            )
+                .into(),
+            compression: Compression::gzip_default(),
+            batch: BatchConfig::default(),
+            request: TowerRequestConfig::default(),
+            acknowledgements: Default::default(),
+            tls: None,
+            confinement: ConfinementConfig::default(),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains(
+                "One of `connection_string`, `account_name`, or `blob_endpoint` must be provided"
+            )),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_connection_string_and_account_name() {
+        use crate::config::SinkConfig;
+
+        let config = AzureBlobSinkConfig {
+            auth: None,
+            connection_string: Some(
+                "DefaultEndpointsProtocol=https;AccountName=test;"
+                    .to_string()
+                    .into(),
+            ),
+            account_name: Some("test".to_string()),
+            blob_endpoint: None,
+            container_name: "logs".to_string(),
+            blob_prefix: default_blob_prefix(),
+            blob_time_format: None,
+            blob_append_uuid: None,
+            encoding: (
+                Some(NewlineDelimitedEncoderConfig::new()),
+                JsonSerializerConfig::default(),
+            )
+                .into(),
+            compression: Compression::gzip_default(),
+            batch: BatchConfig::default(),
+            request: TowerRequestConfig::default(),
+            acknowledgements: Default::default(),
+            tls: None,
+            confinement: ConfinementConfig::default(),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("Cannot provide both `connection_string` and `account_name`")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_account_name_without_auth() {
+        use crate::config::SinkConfig;
+
+        let config = AzureBlobSinkConfig {
+            auth: None,
+            connection_string: None,
+            account_name: Some("testaccount".to_string()),
+            blob_endpoint: None,
+            container_name: "logs".to_string(),
+            blob_prefix: default_blob_prefix(),
+            blob_time_format: None,
+            blob_append_uuid: None,
+            encoding: (
+                Some(NewlineDelimitedEncoderConfig::new()),
+                JsonSerializerConfig::default(),
+            )
+                .into(),
+            compression: Compression::gzip_default(),
+            batch: BatchConfig::default(),
+            request: TowerRequestConfig::default(),
+            acknowledgements: Default::default(),
+            tls: None,
+            confinement: ConfinementConfig::default(),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e
+                    .contains("`auth` configuration must be provided when using `account_name`")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_blob_endpoint_without_auth() {
+        use crate::config::SinkConfig;
+
+        let config = AzureBlobSinkConfig {
+            auth: None,
+            connection_string: None,
+            account_name: None,
+            blob_endpoint: Some("https://test.blob.core.windows.net/".to_string()),
+            container_name: "logs".to_string(),
+            blob_prefix: default_blob_prefix(),
+            blob_time_format: None,
+            blob_append_uuid: None,
+            encoding: (
+                Some(NewlineDelimitedEncoderConfig::new()),
+                JsonSerializerConfig::default(),
+            )
+                .into(),
+            compression: Compression::gzip_default(),
+            batch: BatchConfig::default(),
+            request: TowerRequestConfig::default(),
+            acknowledgements: Default::default(),
+            tls: None,
+            confinement: ConfinementConfig::default(),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e
+                    .contains("`auth` configuration must be provided when using `blob_endpoint`")),
+            "unexpected errors: {:?}",
+            errors
+        );
     }
 }
 

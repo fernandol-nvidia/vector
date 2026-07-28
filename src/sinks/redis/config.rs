@@ -229,6 +229,10 @@ impl SinkConfig for RedisSinkConfig {
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
+        if self.key.is_empty() {
+            errors.push("`key` cannot be empty.".to_string());
+        }
+
         if let Err(e) = self
             .key
             .clone()
@@ -415,5 +419,36 @@ mod tests {
         let config = ConfinementConfig::default();
         let result = template.confine(&config, "redis", "key");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_structure_rejects_empty_key() {
+        use super::*;
+        use crate::codecs::TextSerializerConfig;
+        use crate::config::SinkConfig;
+        use crate::sinks::util::batch::BatchConfig;
+
+        let config = RedisSinkConfig {
+            key: Template::try_from("").unwrap(),
+            endpoint: vec!["redis://127.0.0.1:6379".to_string()].into(),
+            encoding: EncodingConfig::from(TextSerializerConfig::default()),
+            data_type: DataTypeConfig::default(),
+            list_option: None,
+            sorted_set_option: None,
+            sentinel_service: None,
+            sentinel_connect: None,
+            batch: BatchConfig::default(),
+            request: TowerRequestConfig::default(),
+            acknowledgements: AcknowledgementsConfig::default(),
+            confinement: ConfinementConfig::default(),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("key") && errors[0].contains("empty"),
+            "unexpected error: {:?}",
+            errors[0]
+        );
     }
 }

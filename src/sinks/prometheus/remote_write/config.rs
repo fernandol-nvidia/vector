@@ -197,6 +197,16 @@ impl SinkConfig for RemoteWriteConfig {
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
+        // Validate endpoint can be parsed as URI
+        if let Err(e) = self.endpoint.parse::<Uri>() {
+            errors.push(format!("endpoint: invalid URI: {e}"));
+        }
+
+        // Validate headers (format and auth conflict)
+        if let Err(e) = validate_headers(&self.request.headers, self.auth.is_some()) {
+            errors.push(format!("request.headers: {e}"));
+        }
+
         if let Some(tenant_id) = self.tenant_id.clone()
             && let Err(e) = tenant_id.confine(&self.confinement, Self::NAME, "tenant_id")
         {
@@ -389,6 +399,79 @@ mod tests {
         assert!(
             rendered.starts_with("team-"),
             "operator-controlled prefix must be preserved in rendered tenant_id"
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_invalid_endpoint() {
+        use crate::config::SinkConfig;
+
+        let config = RemoteWriteConfig {
+            endpoint: "not a valid uri".to_string(),
+            ..Default::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("endpoint") && e.contains("invalid URI")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_authorization_header_with_auth() {
+        use crate::config::SinkConfig;
+        use crate::sinks::prometheus::PrometheusRemoteWriteAuth;
+
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".to_string(), "Bearer token".to_string());
+
+        let config = RemoteWriteConfig {
+            endpoint: "https://localhost:8087/api/v1/write".to_string(),
+            request: RemoteWriteRequestConfig {
+                headers,
+                ..Default::default()
+            },
+            auth: Some(PrometheusRemoteWriteAuth::Bearer {
+                token: "test".to_string().into(),
+            }),
+            ..Default::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("Authorization") && e.contains("auth options")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_malformed_headers() {
+        use crate::config::SinkConfig;
+
+        let mut headers = BTreeMap::new();
+        headers.insert("Invalid-Header\n".to_string(), "value".to_string());
+
+        let config = RemoteWriteConfig {
+            endpoint: "https://localhost:8087/api/v1/write".to_string(),
+            request: RemoteWriteRequestConfig {
+                headers,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("headers")),
+            "unexpected errors: {:?}",
+            errors
         );
     }
 }

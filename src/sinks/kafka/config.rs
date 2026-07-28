@@ -320,6 +320,40 @@ impl SinkConfig for KafkaSinkConfig {
             errors.push(e.to_string());
         }
 
+        // Check for conflicts between batch options and librdkafka_options
+        // These mirror the checks in to_rdkafka() so validate --no-environment
+        // catches them before boot.
+        if let Some(value) = self.batch.timeout_secs {
+            let key = "queue.buffering.max.ms";
+            if let Some(val) = self.librdkafka_options.get(key) {
+                errors.push(format!(
+                    "Batching setting `batch.timeout_secs` sets `librdkafka_options.{key}={value}`. \
+                    The config already sets this as `librdkafka_options.queue.buffering.max.ms={val}`. \
+                    Please delete one."
+                ));
+            }
+        }
+        if let Some(value) = self.batch.max_events {
+            let key = "batch.num.messages";
+            if let Some(val) = self.librdkafka_options.get(key) {
+                errors.push(format!(
+                    "Batching setting `batch.max_events` sets `librdkafka_options.{key}={value}`. \
+                    The config already sets this as `librdkafka_options.batch.num.messages={val}`. \
+                    Please delete one."
+                ));
+            }
+        }
+        if let Some(value) = self.batch.max_bytes {
+            let key = "batch.size";
+            if let Some(val) = self.librdkafka_options.get(key) {
+                errors.push(format!(
+                    "Batching setting `batch.max_bytes` sets `librdkafka_options.{key}={value}`. \
+                    The config already sets this as `librdkafka_options.batch.size={val}`. \
+                    Please delete one."
+                ));
+            }
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -362,5 +396,77 @@ mod tests {
         let config = ConfinementConfig::default();
         let result = template.confine(&config, "kafka", "topic");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_structure_rejects_batch_timeout_conflict() {
+        use crate::config::SinkConfig;
+        use std::collections::HashMap;
+
+        let mut config: KafkaSinkConfig = KafkaSinkConfig::generate_config().try_into().unwrap();
+        config.batch.timeout_secs = Some(5.0);
+        config.librdkafka_options =
+            HashMap::from_iter([("queue.buffering.max.ms".to_string(), "1000".to_string())]);
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("batch.timeout_secs") && e.contains("queue.buffering.max.ms")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_batch_max_events_conflict() {
+        use crate::config::SinkConfig;
+        use std::collections::HashMap;
+
+        let mut config: KafkaSinkConfig = KafkaSinkConfig::generate_config().try_into().unwrap();
+        config.batch.max_events = Some(100);
+        config.librdkafka_options =
+            HashMap::from_iter([("batch.num.messages".to_string(), "50".to_string())]);
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("batch.max_events") && e.contains("batch.num.messages")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_batch_max_bytes_conflict() {
+        use crate::config::SinkConfig;
+        use std::collections::HashMap;
+
+        let mut config: KafkaSinkConfig = KafkaSinkConfig::generate_config().try_into().unwrap();
+        config.batch.max_bytes = Some(1024);
+        config.librdkafka_options =
+            HashMap::from_iter([("batch.size".to_string(), "512".to_string())]);
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("batch.max_bytes") && e.contains("batch.size")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_allows_batch_without_conflict() {
+        use crate::config::SinkConfig;
+
+        let mut config: KafkaSinkConfig = KafkaSinkConfig::generate_config().try_into().unwrap();
+        config.batch.timeout_secs = Some(5.0);
+        config.batch.max_events = Some(100);
+        config.batch.max_bytes = Some(1024);
+
+        config.validate_structure().unwrap();
     }
 }

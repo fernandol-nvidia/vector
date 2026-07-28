@@ -298,6 +298,33 @@ impl SinkConfig for ClickhouseConfig {
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
+        // Validate batch_encoding compatibility with format
+        if self.batch_encoding.is_some() && self.format != Format::ArrowStream {
+            errors.push(format!(
+                "'batch_encoding' is only compatible with 'format: arrow_stream'. Found 'format: {}'.",
+                self.format
+            ));
+        }
+
+        // Arrow codec requires static table and database (no dynamic templates)
+        if self.batch_encoding.is_some() {
+            if self.table.is_dynamic() {
+                errors.push(
+                    "Arrow codec requires a static table. Dynamic schema inference is not supported."
+                        .to_string(),
+                );
+            }
+            let database_template = self.database.clone().unwrap_or_else(|| {
+                Template::try_from("default").expect("default database template is valid")
+            });
+            if database_template.is_dynamic() {
+                errors.push(
+                    "Arrow codec requires a static database. Dynamic schema inference is not supported."
+                        .to_string(),
+                );
+            }
+        }
+
         if let Err(e) = self
             .table
             .clone()
@@ -596,5 +623,105 @@ mod tests {
                 "format should match configured value"
             );
         }
+    }
+
+    #[test]
+    fn validate_structure_rejects_batch_encoding_with_incompatible_format() {
+        use crate::config::SinkConfig;
+
+        let incompatible_formats = vec![
+            (Format::JsonEachRow, "json_each_row"),
+            (Format::JsonAsObject, "json_as_object"),
+            (Format::JsonAsString, "json_as_string"),
+        ];
+
+        for (format, format_name) in incompatible_formats {
+            let config = create_test_config(
+                format,
+                Some(ClickhouseBatchEncoding::ArrowStream(
+                    ArrowStreamSerializerConfig::default(),
+                )),
+            );
+
+            let errors = config.validate_structure().unwrap_err();
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.contains("batch_encoding") && e.contains("arrow_stream")),
+                "expected batch_encoding error for format {}, got: {:?}",
+                format_name,
+                errors
+            );
+        }
+    }
+
+    #[test]
+    fn validate_structure_rejects_dynamic_table_with_batch_encoding() {
+        use crate::config::SinkConfig;
+
+        let config = ClickhouseConfig {
+            endpoint: "http://localhost:8123".parse::<http::Uri>().unwrap().into(),
+            table: "events-{{ env }}".try_into().unwrap(),
+            database: Some("test_db".try_into().unwrap()),
+            format: Format::ArrowStream,
+            batch_encoding: Some(ClickhouseBatchEncoding::ArrowStream(
+                ArrowStreamSerializerConfig::default(),
+            )),
+            confinement: ConfinementConfig {
+                dangerously_allow_unconfined_template_resolution: true,
+            },
+            ..Default::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("static table")),
+            "expected static table error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_dynamic_database_with_batch_encoding() {
+        use crate::config::SinkConfig;
+
+        let config = ClickhouseConfig {
+            endpoint: "http://localhost:8123".parse::<http::Uri>().unwrap().into(),
+            table: "test_table".try_into().unwrap(),
+            database: Some("db-{{ tenant }}".try_into().unwrap()),
+            format: Format::ArrowStream,
+            batch_encoding: Some(ClickhouseBatchEncoding::ArrowStream(
+                ArrowStreamSerializerConfig::default(),
+            )),
+            confinement: ConfinementConfig {
+                dangerously_allow_unconfined_template_resolution: true,
+            },
+            ..Default::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("static database")),
+            "expected static database error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_allows_static_table_with_batch_encoding() {
+        use crate::config::SinkConfig;
+
+        let config = ClickhouseConfig {
+            endpoint: "http://localhost:8123".parse::<http::Uri>().unwrap().into(),
+            table: "test_table".try_into().unwrap(),
+            database: Some("test_db".try_into().unwrap()),
+            format: Format::ArrowStream,
+            batch_encoding: Some(ClickhouseBatchEncoding::ArrowStream(
+                ArrowStreamSerializerConfig::default(),
+            )),
+            ..Default::default()
+        };
+
+        config.validate_structure().unwrap();
     }
 }

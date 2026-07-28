@@ -217,6 +217,11 @@ impl SinkConfig for NatsSinkConfig {
             errors.push(e.to_string());
         }
 
+        // Parse server addresses to catch malformed URLs early
+        if let Err(e) = self.parse_server_addresses() {
+            errors.push(format!("url: {}", e));
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -336,6 +341,7 @@ impl NatsPublisher {
 #[cfg(test)]
 mod tests {
     use crate::template::{ConfinementConfig, Template};
+    use vector_lib::codecs::JsonSerializerConfig;
 
     #[test]
     fn confinement_rejects_unconfined_subject() {
@@ -361,5 +367,51 @@ mod tests {
         let config = ConfinementConfig::default();
         let result = template.confine(&config, "nats", "subject");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_structure_rejects_malformed_url() {
+        use crate::config::SinkConfig;
+
+        let config = super::NatsSinkConfig {
+            acknowledgements: Default::default(),
+            auth: None,
+            connection_name: "vector".into(),
+            encoding: JsonSerializerConfig::default().into(),
+            subject: Template::try_from("events").unwrap(),
+            tls: None,
+            // Use an invalid protocol scheme that async_nats::ServerAddr will reject
+            url: "invalid://test".into(),
+            request: Default::default(),
+            jetstream: Default::default(),
+            confinement: ConfinementConfig::default(),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("url")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_allows_valid_url() {
+        use crate::config::SinkConfig;
+
+        let config = super::NatsSinkConfig {
+            acknowledgements: Default::default(),
+            auth: None,
+            connection_name: "vector".into(),
+            encoding: JsonSerializerConfig::default().into(),
+            subject: Template::try_from("events").unwrap(),
+            tls: None,
+            url: "nats://localhost:4222".into(),
+            request: Default::default(),
+            jetstream: Default::default(),
+            confinement: ConfinementConfig::default(),
+        };
+
+        config.validate_structure().unwrap();
     }
 }

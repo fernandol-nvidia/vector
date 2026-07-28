@@ -106,6 +106,13 @@ impl SinkConfig for OpenTelemetryConfig {
             Protocol::Http(ref config) => config.acknowledgements(),
         }
     }
+
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        // Delegate to HTTP config validation
+        match &self.protocol {
+            Protocol::Http(config) => config.validate_structure(),
+        }
+    }
 }
 
 fn warn_on_invalid_otlp_batching(config: &HttpSinkConfig) {
@@ -125,8 +132,83 @@ fn warn_on_invalid_otlp_batching(config: &HttpSinkConfig) {
 
 #[cfg(test)]
 mod test {
+    use vector_lib::codecs::encoding::{FramingConfig, JsonSerializerConfig, SerializerConfig};
+
+    use super::*;
+    use crate::{
+        codecs::{EncodingConfigWithFraming, Transformer},
+        sinks::{
+            http::config::HttpSinkConfig,
+            util::{
+                BatchConfig, Compression,
+                http::{RequestConfig, RetryStrategy},
+            },
+        },
+        template::Template,
+    };
+
     #[test]
     fn generate_config() {
-        crate::test_util::test_generate_config::<super::OpenTelemetryConfig>();
+        crate::test_util::test_generate_config::<OpenTelemetryConfig>();
+    }
+
+    #[test]
+    fn confinement_rejects_unconfined_uri() {
+        let config = OpenTelemetryConfig {
+            protocol: Protocol::Http(HttpSinkConfig {
+                uri: Template::try_from("{{ target }}").unwrap(),
+                compression: Compression::default(),
+                auth: None,
+                method: Default::default(),
+                tls: None,
+                request: RequestConfig::default(),
+                acknowledgements: Default::default(),
+                batch: BatchConfig::default(),
+                encoding: EncodingConfigWithFraming::new(
+                    Some(FramingConfig::NewlineDelimited),
+                    SerializerConfig::Json(JsonSerializerConfig::default()),
+                    Transformer::default(),
+                ),
+                payload_prefix: "".into(),
+                payload_suffix: "".into(),
+                retry_strategy: RetryStrategy::default(),
+                confinement: crate::template::ConfinementConfig::default(),
+            }),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("no literal string prefix"),
+            "unexpected error: {:?}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn confinement_allows_prefixed_uri() {
+        let config = OpenTelemetryConfig {
+            protocol: Protocol::Http(HttpSinkConfig {
+                uri: Template::try_from("http://localhost/{{ path }}").unwrap(),
+                compression: Compression::default(),
+                auth: None,
+                method: Default::default(),
+                tls: None,
+                request: RequestConfig::default(),
+                acknowledgements: Default::default(),
+                batch: BatchConfig::default(),
+                encoding: EncodingConfigWithFraming::new(
+                    Some(FramingConfig::NewlineDelimited),
+                    SerializerConfig::Json(JsonSerializerConfig::default()),
+                    Transformer::default(),
+                ),
+                payload_prefix: "".into(),
+                payload_suffix: "".into(),
+                retry_strategy: RetryStrategy::default(),
+                confinement: crate::template::ConfinementConfig::default(),
+            }),
+        };
+
+        config.validate_structure().unwrap();
     }
 }

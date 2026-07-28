@@ -212,6 +212,53 @@ impl SinkConfig for AxiomConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
+
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        // Validate endpoint settings (url and region must not both be set)
+        if let Err(e) = self.endpoint.validate() {
+            return Err(vec![e.to_string()]);
+        }
+
+        // Build HTTP config for validation (mirrors build() logic)
+        let uri: crate::template::Template = match self.build_endpoint().try_into() {
+            Ok(uri) => uri,
+            Err(e) => return Err(vec![e.to_string()]),
+        };
+
+        let mut request = self.request.clone();
+        if let Some(org_id) = &self.org_id {
+            request
+                .headers
+                .insert("X-Axiom-Org-Id".to_string(), org_id.clone());
+        }
+
+        let http_sink_config = HttpSinkConfig {
+            uri,
+            compression: self.compression,
+            auth: Some(HttpAuthConfig::Bearer {
+                token: self.token.clone(),
+            }),
+            method: HttpMethod::Post,
+            tls: self.tls.clone(),
+            request,
+            acknowledgements: self.acknowledgements,
+            batch: self.batch,
+            encoding: EncodingConfigWithFraming::new(
+                Some(FramingConfig::NewlineDelimited),
+                SerializerConfig::Json(JsonSerializerConfig {
+                    metric_tag_values: MetricTagValues::Single,
+                    options: JsonSerializerOptions { pretty: false },
+                }),
+                Transformer::default(),
+            ),
+            payload_prefix: "".into(),
+            payload_suffix: "".into(),
+            retry_strategy: self.retry_strategy.clone(),
+            confinement: self.confinement.clone(),
+        };
+
+        http_sink_config.validate_structure()
+    }
 }
 
 impl AxiomConfig {
@@ -418,6 +465,96 @@ mod test {
         assert_eq!(
             endpoint,
             "https://eu-west-1.edge.dev.axiomdomain.co/v1/ingest/dev-dataset"
+        );
+    }
+
+    #[test]
+    fn confinement_rejects_unconfined_url() {
+        use crate::config::{AcknowledgementsConfig, SinkConfig};
+        use crate::sinks::util::http::{RequestConfig, RetryStrategy};
+        use crate::sinks::util::{BatchConfig, Compression};
+
+        let config = super::AxiomConfig {
+            endpoint: super::UrlOrRegion {
+                region: None,
+                url: Some("{{ target }}".to_string()),
+            },
+            dataset: "test-dataset".to_string(),
+            token: "test-token".to_string().into(),
+            org_id: None,
+            compression: Compression::default(),
+            request: RequestConfig::default(),
+            batch: BatchConfig::default(),
+            acknowledgements: AcknowledgementsConfig::default(),
+            tls: None,
+            retry_strategy: RetryStrategy::default(),
+            confinement: crate::template::ConfinementConfig::default(),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("no literal string prefix"),
+            "unexpected error: {:?}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn confinement_allows_prefixed_url() {
+        use crate::config::{AcknowledgementsConfig, SinkConfig};
+        use crate::sinks::util::http::{RequestConfig, RetryStrategy};
+        use crate::sinks::util::{BatchConfig, Compression};
+
+        let config = super::AxiomConfig {
+            endpoint: super::UrlOrRegion {
+                region: None,
+                url: Some("https://api.axiom.co/{{ path }}".to_string()),
+            },
+            dataset: "test-dataset".to_string(),
+            token: "test-token".to_string().into(),
+            org_id: None,
+            compression: Compression::default(),
+            request: RequestConfig::default(),
+            batch: BatchConfig::default(),
+            acknowledgements: AcknowledgementsConfig::default(),
+            tls: None,
+            retry_strategy: RetryStrategy::default(),
+            confinement: crate::template::ConfinementConfig::default(),
+        };
+
+        config.validate_structure().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_both_url_and_region() {
+        use crate::config::{AcknowledgementsConfig, SinkConfig};
+        use crate::sinks::util::http::{RequestConfig, RetryStrategy};
+        use crate::sinks::util::{BatchConfig, Compression};
+
+        let config = super::AxiomConfig {
+            endpoint: super::UrlOrRegion {
+                region: Some("eu-central-1.aws.edge.axiom.co".to_string()),
+                url: Some("https://api.axiom.co".to_string()),
+            },
+            dataset: "test-dataset".to_string(),
+            token: "test-token".to_string().into(),
+            org_id: None,
+            compression: Compression::default(),
+            request: RequestConfig::default(),
+            batch: BatchConfig::default(),
+            acknowledgements: AcknowledgementsConfig::default(),
+            tls: None,
+            retry_strategy: RetryStrategy::default(),
+            confinement: crate::template::ConfinementConfig::default(),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("url") && errors[0].contains("region"),
+            "unexpected error: {:?}",
+            errors[0]
         );
     }
 }

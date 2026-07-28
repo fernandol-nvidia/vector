@@ -194,6 +194,11 @@ impl SinkConfig for HumioLogsConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
+
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        // Delegate to HEC config validation with the outer component name
+        self.build_hec_config().validate_structure()
+    }
 }
 
 impl HumioLogsConfig {
@@ -210,7 +215,7 @@ impl HumioLogsConfig {
             .build_with_component_type(cx, component_name)
     }
 
-    fn build_hec_config(&self) -> HecLogsSinkConfig {
+    pub(super) fn build_hec_config(&self) -> HecLogsSinkConfig {
         HecLogsSinkConfig {
             default_token: self.token.clone(),
             endpoint: self.endpoint.clone(),
@@ -244,6 +249,60 @@ mod tests {
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<HumioLogsConfig>();
+    }
+
+    #[test]
+    fn confinement_rejects_unconfined_index() {
+        let config = HumioLogsConfig {
+            token: SensitiveString::from("test-token".to_string()),
+            endpoint: default_endpoint(),
+            source: None,
+            encoding: JsonSerializerConfig::default().into(),
+            event_type: None,
+            indexed_fields: vec![],
+            index: Some(Template::try_from("{{ tenant }}").unwrap()),
+            host_key: config_host_key_target_path(),
+            compression: Compression::default(),
+            request: TowerRequestConfig::default(),
+            batch: BatchConfig::default(),
+            tls: None,
+            timestamp_nanos_key: None,
+            acknowledgements: AcknowledgementsConfig::default(),
+            timestamp_key: config_timestamp_key_target_path(),
+            confinement: crate::template::ConfinementConfig::default(),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("no literal string prefix"),
+            "unexpected error: {:?}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn confinement_allows_prefixed_index() {
+        let config = HumioLogsConfig {
+            token: SensitiveString::from("test-token".to_string()),
+            endpoint: default_endpoint(),
+            source: None,
+            encoding: JsonSerializerConfig::default().into(),
+            event_type: None,
+            indexed_fields: vec![],
+            index: Some(Template::try_from("prefix/{{ tenant }}").unwrap()),
+            host_key: config_host_key_target_path(),
+            compression: Compression::default(),
+            request: TowerRequestConfig::default(),
+            batch: BatchConfig::default(),
+            tls: None,
+            timestamp_nanos_key: None,
+            acknowledgements: AcknowledgementsConfig::default(),
+            timestamp_key: config_timestamp_key_target_path(),
+            confinement: crate::template::ConfinementConfig::default(),
+        };
+
+        config.validate_structure().unwrap();
     }
 }
 

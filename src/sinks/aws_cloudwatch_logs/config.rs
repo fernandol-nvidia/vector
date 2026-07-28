@@ -270,10 +270,10 @@ impl SinkConfig for CloudwatchLogsSinkConfig {
             errors.push(e.to_string());
         }
 
-        if let Err(e) = self
-            .stream_name
-            .clone()
-            .confine(&self.confinement, Self::NAME, "stream_name")
+        if let Err(e) =
+            self.stream_name
+                .clone()
+                .confine(&self.confinement, Self::NAME, "stream_name")
         {
             errors.push(e.to_string());
         }

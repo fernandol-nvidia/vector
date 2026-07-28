@@ -165,31 +165,7 @@ impl SinkConfig for HumioMetricsConfig {
             .transform
             .build_transform(&TransformContext::new_with_globals(cx.globals.clone()));
 
-        let sink = HumioLogsConfig {
-            token: self.token.clone(),
-            endpoint: self.endpoint.clone(),
-            source: self.source.clone(),
-            encoding: JsonSerializerConfig::default().into(),
-            event_type: self.event_type.clone(),
-            host_key: OptionalTargetPath::from(
-                vrl::path::PathPrefix::Event,
-                self.host_key.path.clone(),
-            ),
-            indexed_fields: self.indexed_fields.clone(),
-            index: self.index.clone(),
-            compression: self.compression,
-            request: self.request,
-            batch: self.batch,
-            tls: self.tls.clone(),
-            timestamp_nanos_key: None,
-            acknowledgements: Default::default(),
-            // hard coded as humio expects this format so no sense in making it configurable
-            timestamp_key: OptionalTargetPath::from(
-                vrl::path::PathPrefix::Event,
-                Some(lookup::owned_value_path!("timestamp")),
-            ),
-            confinement: self.confinement.clone(),
-        };
+        let sink = self.build_logs_config();
 
         // Route through the inner Humio helper threaded with our own component
         // type, so per-template security warnings carry `humio_metrics` rather
@@ -213,6 +189,43 @@ impl SinkConfig for HumioMetricsConfig {
 
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
+    }
+
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        // Delegate to the humio_logs config validation with the outer component name
+        self.build_logs_config()
+            .build_hec_config()
+            .validate_structure()
+    }
+}
+
+impl HumioMetricsConfig {
+    fn build_logs_config(&self) -> HumioLogsConfig {
+        HumioLogsConfig {
+            token: self.token.clone(),
+            endpoint: self.endpoint.clone(),
+            source: self.source.clone(),
+            encoding: JsonSerializerConfig::default().into(),
+            event_type: self.event_type.clone(),
+            host_key: OptionalTargetPath::from(
+                vrl::path::PathPrefix::Event,
+                self.host_key.path.clone(),
+            ),
+            indexed_fields: self.indexed_fields.clone(),
+            index: self.index.clone(),
+            compression: self.compression,
+            request: self.request,
+            batch: self.batch,
+            tls: self.tls.clone(),
+            timestamp_nanos_key: None,
+            acknowledgements: Default::default(),
+            // hard coded as humio expects this format so no sense in making it configurable
+            timestamp_key: OptionalTargetPath::from(
+                vrl::path::PathPrefix::Event,
+                Some(lookup::owned_value_path!("timestamp")),
+            ),
+            confinement: self.confinement.clone(),
+        }
     }
 }
 
@@ -263,6 +276,56 @@ mod tests {
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<HumioMetricsConfig>();
+    }
+
+    #[test]
+    fn confinement_rejects_unconfined_index() {
+        let config = HumioMetricsConfig {
+            transform: MetricToLogConfig::default(),
+            token: SensitiveString::from("test-token".to_string()),
+            endpoint: default_endpoint(),
+            source: None,
+            event_type: None,
+            host_key: config_host_key(),
+            indexed_fields: vec![],
+            index: Some(Template::try_from("{{ tenant }}").unwrap()),
+            compression: Compression::default(),
+            request: TowerRequestConfig::default(),
+            batch: BatchConfig::default(),
+            tls: None,
+            acknowledgements: AcknowledgementsConfig::default(),
+            confinement: crate::template::ConfinementConfig::default(),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("no literal string prefix"),
+            "unexpected error: {:?}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn confinement_allows_prefixed_index() {
+        let config = HumioMetricsConfig {
+            transform: MetricToLogConfig::default(),
+            token: SensitiveString::from("test-token".to_string()),
+            endpoint: default_endpoint(),
+            source: None,
+            event_type: None,
+            host_key: config_host_key(),
+            indexed_fields: vec![],
+            index: Some(Template::try_from("prefix/{{ tenant }}").unwrap()),
+            compression: Compression::default(),
+            request: TowerRequestConfig::default(),
+            batch: BatchConfig::default(),
+            tls: None,
+            acknowledgements: AcknowledgementsConfig::default(),
+            confinement: crate::template::ConfinementConfig::default(),
+        };
+
+        config.validate_structure().unwrap();
     }
 
     #[test]

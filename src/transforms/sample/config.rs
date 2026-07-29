@@ -163,8 +163,8 @@ impl SampleConfig {
 }
 
 impl GenerateConfig for SampleConfig {
-    fn generate_config() -> toml::Value {
-        toml::Value::try_from(Self {
+    fn generate_config() -> serde_json::Value {
+        serde_json::to_value(Self {
             rate: None,
             ratio: Some(0.1),
             ratio_field: None,
@@ -219,7 +219,7 @@ impl TransformConfig for SampleConfig {
         Input::new(DataType::Log | DataType::Trace)
     }
 
-    fn validate(&self, _: &TransformContext) -> Result<(), Vec<String>> {
+    fn validate_structure(&self) -> Result<(), Vec<String>> {
         self.sample_rate()
             .map(|_| ())
             .map_err(|e| vec![e.to_string()])
@@ -326,11 +326,7 @@ mod tests {
             exclude: None,
         };
 
-        assert!(
-            config
-                .validate(&crate::config::TransformContext::default())
-                .is_ok()
-        );
+        assert!(config.validate_structure().is_ok());
     }
 
     #[test]

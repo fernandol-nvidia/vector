@@ -292,8 +292,15 @@ impl SinkConfig for HttpSinkConfig {
             match self.uri.get_ref().parse::<UriSerde>() {
                 Ok(uri_serde) => {
                     // Check that static URI has scheme and host
-                    if uri_serde.uri.scheme().is_none() {
+                    let scheme = uri_serde.uri.scheme();
+                    if scheme.is_none() {
                         errors.push("uri: must include a scheme (http:// or https://)".to_string());
+                    }
+                    if let Some(s) = scheme
+                        && s != "http"
+                        && s != "https"
+                    {
+                        errors.push(format!("uri: scheme must be http or https, got '{}'", s));
                     }
                     if uri_serde.uri.host().is_none() {
                         errors.push("uri: must include a host".to_string());
@@ -311,15 +318,16 @@ impl SinkConfig for HttpSinkConfig {
             // For dynamic URIs, check if the static prefix contains embedded auth
             // This would conflict with top-level auth on every render
             let uri_str = self.uri.get_ref();
-            if uri_str.contains("://")
-                && let Some(at_pos) = uri_str.find('@')
-                && let Some(scheme_end) = uri_str.find("://")
-                && at_pos > scheme_end
-                && self.auth.is_some()
-            {
-                errors.push(
-                    "uri: contains embedded credentials that conflict with `auth`. Remove credentials from the URI or remove `auth`.".to_string()
-                );
+            // Parse the authority part only (between :// and /)
+            // Use split to avoid UTF-8 slicing issues
+            if let Some(after_scheme) = uri_str.split("://").nth(1) {
+                let authority = after_scheme.split('/').next().unwrap_or("");
+                // Check for embedded credentials (user:pass@host)
+                if authority.contains('@') && self.auth.is_some() {
+                    errors.push(
+                        "uri: contains embedded credentials that conflict with `auth`. Remove credentials from the URI or remove `auth`.".to_string()
+                    );
+                }
             }
         }
 
@@ -338,16 +346,28 @@ impl SinkConfig for HttpSinkConfig {
         }
 
         // Validate payload wrapper for JSON encoding with comma-delimited framing
-        match self.build_encoder() {
-            Ok(encoder) => {
-                if let Err(e) =
-                    validate_payload_wrapper(&self.payload_prefix, &self.payload_suffix, &encoder)
-                {
-                    errors.push(format!("payload_prefix/payload_suffix: {e}"));
+        // Note: Skip encoder validation for encodings that require external files (e.g., Protobuf)
+        // as validate_structure is meant for config-level checks without I/O
+        let serializer = self.encoding.config().1;
+        let needs_external_file = matches!(
+            serializer,
+            vector_lib::codecs::encoding::SerializerConfig::Protobuf(_)
+        );
+
+        if !needs_external_file {
+            match self.build_encoder() {
+                Ok(encoder) => {
+                    if let Err(e) = validate_payload_wrapper(
+                        &self.payload_prefix,
+                        &self.payload_suffix,
+                        &encoder,
+                    ) {
+                        errors.push(format!("payload_prefix/payload_suffix: {e}"));
+                    }
                 }
-            }
-            Err(e) => {
-                errors.push(format!("encoding: {e}"));
+                Err(e) => {
+                    errors.push(format!("encoding: {e}"));
+                }
             }
         }
 
@@ -858,5 +878,69 @@ mod tests {
             "unexpected errors: {:?}",
             errors
         );
+    }
+
+    #[test]
+    fn validate_structure_rejects_non_http_scheme() {
+        // FTP scheme should be rejected
+        let config = HttpSinkConfig {
+            uri: Template::try_from("ftp://example.com/endpoint").unwrap(),
+            method: HttpMethod::default(),
+            encoding: EncodingConfigWithFraming::new(
+                None,
+                JsonSerializerConfig::new(MetricTagValues::Full, JsonSerializerOptions::default())
+                    .into(),
+                Transformer::default(),
+            ),
+            auth: None,
+            compression: Compression::default(),
+            batch: BatchConfig::default(),
+            request: RequestConfig::default(),
+            tls: None,
+            acknowledgements: AcknowledgementsConfig::default(),
+            payload_prefix: String::new(),
+            payload_suffix: String::new(),
+            retry_strategy: RetryStrategy::default(),
+            confinement: ConfinementConfig::default(),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("scheme") && e.contains("http")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_allows_at_in_path_of_dynamic_uri() {
+        // @ in path should not trigger embedded credentials check (only authority should be checked)
+        let config = HttpSinkConfig {
+            uri: Template::try_from("https://api.example.com/users/{{ id }}").unwrap(),
+            method: HttpMethod::default(),
+            encoding: EncodingConfigWithFraming::new(
+                None,
+                JsonSerializerConfig::new(MetricTagValues::Full, JsonSerializerOptions::default())
+                    .into(),
+                Transformer::default(),
+            ),
+            auth: Some(crate::http::Auth::Bearer {
+                token: "test".to_string().into(),
+            }),
+            compression: Compression::default(),
+            batch: BatchConfig::default(),
+            request: RequestConfig::default(),
+            tls: None,
+            acknowledgements: AcknowledgementsConfig::default(),
+            payload_prefix: String::new(),
+            payload_suffix: String::new(),
+            retry_strategy: RetryStrategy::default(),
+            confinement: ConfinementConfig::default(),
+        };
+
+        // Should pass because @ is in the path, not the authority
+        config.validate_structure().unwrap();
     }
 }

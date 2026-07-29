@@ -288,7 +288,23 @@ impl SinkConfig for S3SinkConfig {
             errors.push(format!("batch: {e}"));
         }
 
-        // Validate encoding configuration (mirrors build_processor check)
+        // Validate encoding configuration:
+        // - When batch_encoding is set (e.g., Parquet), validate the batch serializer
+        // - Otherwise validate the normal encoding
+        #[cfg(feature = "codecs-parquet")]
+        if let Some(batch_encoding) = &self.batch_encoding {
+            let S3BatchEncoding::Parquet(parquet_config) = batch_encoding;
+            let resolved_batch_config = BatchSerializerConfig::Parquet(parquet_config.clone());
+            if let Err(e) = resolved_batch_config.build_batch_serializer() {
+                errors.push(format!("batch_encoding: {e}"));
+            }
+        } else {
+            if let Err(e) = self.encoding.build(SinkType::MessageBased) {
+                errors.push(format!("encoding: {e}"));
+            }
+        }
+
+        #[cfg(not(feature = "codecs-parquet"))]
         if let Err(e) = self.encoding.build(SinkType::MessageBased) {
             errors.push(format!("encoding: {e}"));
         }

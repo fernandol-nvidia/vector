@@ -245,7 +245,15 @@ impl SinkConfig for RedisSinkConfig {
         let endpoints = self.endpoint.clone().to_vec();
         if endpoints.is_empty() {
             errors.push("`endpoint` cannot be empty.".to_string());
-        } else if self.sentinel_service.is_none() {
+        } else if self.sentinel_service.is_some() {
+            // For sentinel, validate all sentinel endpoint URLs parse correctly
+            // Sentinel::build expects valid URL strings for each endpoint
+            for endpoint in &endpoints {
+                if let Err(e) = redis::Client::open(endpoint.as_str()) {
+                    errors.push(format!("`endpoint` '{endpoint}' is invalid: {e}"));
+                }
+            }
+        } else {
             // For non-sentinel, validate the first endpoint can be parsed
             // redis::Client::open will parse the URL
             if let Err(e) = redis::Client::open(endpoints[0].as_str()) {
@@ -521,6 +529,35 @@ mod tests {
             list_option: None,
             sorted_set_option: None,
             sentinel_service: None,
+            sentinel_connect: None,
+            batch: BatchConfig::default(),
+            request: TowerRequestConfig::default(),
+            acknowledgements: AcknowledgementsConfig::default(),
+            confinement: ConfinementConfig::default(),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("endpoint")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_invalid_sentinel_endpoint() {
+        use super::*;
+        use crate::config::SinkConfig;
+        use crate::sinks::util::TowerRequestConfig;
+
+        let config = RedisSinkConfig {
+            key: Template::try_from("test").unwrap(),
+            endpoint: vec!["not-a-valid-redis-url".to_string()].into(),
+            encoding: EncodingConfig::from(TextSerializerConfig::default()),
+            data_type: DataTypeConfig::default(),
+            list_option: None,
+            sorted_set_option: None,
+            sentinel_service: Some("mymaster".to_string()),
             sentinel_connect: None,
             batch: BatchConfig::default(),
             request: TowerRequestConfig::default(),

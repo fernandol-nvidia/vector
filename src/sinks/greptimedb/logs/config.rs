@@ -267,6 +267,19 @@ impl SinkConfig for GreptimeDBLogsConfig {
             errors.push(format!("batch: {e}"));
         }
 
+        // Validate extra_headers header names and values
+        if let Some(headers) = &self.extra_headers {
+            use http::header::{HeaderName, HeaderValue};
+            for (name, value) in headers {
+                if let Err(e) = HeaderName::from_bytes(name.as_bytes()) {
+                    errors.push(format!("extra_headers.{name}: invalid header name: {e}"));
+                }
+                if let Err(e) = HeaderValue::from_str(value) {
+                    errors.push(format!("extra_headers.{name}: invalid header value: {e}"));
+                }
+            }
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -354,5 +367,53 @@ mod tests {
         };
 
         config.validate_structure().unwrap();
+    }
+
+    #[test]
+    fn validate_structure_rejects_invalid_header_name() {
+        use crate::config::SinkConfig;
+        use std::collections::HashMap;
+
+        let config = GreptimeDBLogsConfig {
+            endpoint: "http://localhost:4000".to_string(),
+            extra_headers: Some(HashMap::from_iter([(
+                "Invalid Header Name".to_string(),
+                "value".to_string(),
+            )])),
+            ..GreptimeDBLogsConfig::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("extra_headers") && e.contains("invalid header name")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_invalid_header_value() {
+        use crate::config::SinkConfig;
+        use std::collections::HashMap;
+
+        let config = GreptimeDBLogsConfig {
+            endpoint: "http://localhost:4000".to_string(),
+            extra_headers: Some(HashMap::from_iter([(
+                "X-Test".to_string(),
+                "bad\nvalue".to_string(),
+            )])),
+            ..GreptimeDBLogsConfig::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("extra_headers") && e.contains("invalid header value")),
+            "unexpected errors: {:?}",
+            errors
+        );
     }
 }

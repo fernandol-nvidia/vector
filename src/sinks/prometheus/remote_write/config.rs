@@ -201,7 +201,11 @@ impl SinkConfig for RemoteWriteConfig {
         match self.endpoint.parse::<Uri>() {
             Ok(uri) => {
                 // Validate endpoint has scheme and host (absolute URI)
-                if uri.scheme().is_none() {
+                if let Some(scheme) = uri.scheme() {
+                    if *scheme != http::uri::Scheme::HTTP && *scheme != http::uri::Scheme::HTTPS {
+                        errors.push("endpoint: scheme must be http or https".to_string());
+                    }
+                } else {
                     errors
                         .push("endpoint: must include a scheme (http:// or https://)".to_string());
                 }
@@ -494,6 +498,25 @@ mod tests {
         let errors = config.validate_structure().unwrap_err();
         assert!(
             errors.iter().any(|e| e.contains("headers")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_non_http_scheme() {
+        use crate::config::SinkConfig;
+
+        let config = RemoteWriteConfig {
+            endpoint: "ftp://localhost:8087/api/v1/write".to_string(),
+            ..Default::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("scheme") && e.contains("http")),
             "unexpected errors: {:?}",
             errors
         );

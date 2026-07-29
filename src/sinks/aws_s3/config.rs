@@ -299,13 +299,13 @@ impl SinkConfig for S3SinkConfig {
                 errors.push(format!("batch_encoding: {e}"));
             }
         } else {
-            if let Err(e) = self.encoding.build(SinkType::MessageBased) {
+            if let Err(e) = self.encoding.validate_structure() {
                 errors.push(format!("encoding: {e}"));
             }
         }
 
         #[cfg(not(feature = "codecs-parquet"))]
-        if let Err(e) = self.encoding.build(SinkType::MessageBased) {
+        if let Err(e) = self.encoding.validate_structure() {
             errors.push(format!("encoding: {e}"));
         }
 

@@ -237,8 +237,8 @@ impl SinkConfig for NatsSinkConfig {
             }
         }
 
-        // Validate encoding configuration (mirrors NatsSink::new check)
-        if let Err(e) = self.encoding.build() {
+        // Validate encoding configuration (structural checks only, no I/O)
+        if let Err(e) = self.encoding.validate_structure() {
             errors.push(format!("encoding: {e}"));
         }
 

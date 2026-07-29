@@ -24,6 +24,39 @@ pub struct ProtobufSerializerConfig {
 }
 
 impl ProtobufSerializerConfig {
+    /// Validates structural constraints on the Protobuf serializer configuration that do not
+    /// require environment resources (like filesystem I/O).
+    ///
+    /// This is called during config compilation so errors are reported on both
+    /// `vector validate --no-environment` and normal startup/reload.
+    ///
+    /// Note: This does NOT read the descriptor file - that check is deferred to `build()`.
+    ///
+    /// # Errors
+    ///
+    /// If validation does not succeed, an error is returned.
+    pub fn validate_structure(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        // Validate message_type is not empty
+        if self.protobuf.message_type.is_empty() {
+            return Err("protobuf.message_type must not be empty".into());
+        }
+        // Validate message_type has a valid format (package.Message)
+        // A valid protobuf message type should contain at least one dot separating package and message
+        if !self.protobuf.message_type.contains('.') {
+            return Err(format!(
+                "protobuf.message_type '{}' must be a fully qualified name (e.g., 'package.Message')",
+                self.protobuf.message_type
+            ).into());
+        }
+        // Validate desc_file is not empty (path validation without reading the file)
+        if self.protobuf.desc_file.as_os_str().is_empty() {
+            return Err("protobuf.desc_file must not be empty".into());
+        }
+        Ok(())
+    }
+
     /// Build the `ProtobufSerializer` from this configuration.
     pub fn build(&self) -> Result<ProtobufSerializer, BuildError> {
         let message_descriptor =

@@ -364,8 +364,8 @@ impl SinkConfig for GcsSinkConfig {
             }
         }
 
-        // Validate encoding configuration (mirrors RequestSettings::new check)
-        if let Err(e) = self.encoding.build(SinkType::MessageBased) {
+        // Validate encoding configuration (structural checks only, no I/O)
+        if let Err(e) = self.encoding.validate_structure() {
             errors.push(format!("encoding: {e}"));
         }
 

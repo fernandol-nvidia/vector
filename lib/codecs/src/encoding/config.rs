@@ -41,6 +41,17 @@ impl EncodingConfig {
         &self.encoding
     }
 
+    /// Validates structural constraints on the encoding configuration that do not require
+    /// environment resources (like filesystem I/O or network access).
+    ///
+    /// This is called during config compilation so errors are reported on both
+    /// `vector validate --no-environment` and normal startup/reload.
+    pub fn validate_structure(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        self.encoding.validate_structure()
+    }
+
     /// Build the `Serializer` for this config.
     pub fn build(&self) -> vector_common::Result<Serializer> {
         self.encoding.build()
@@ -96,6 +107,17 @@ impl EncodingConfigWithFraming {
     /// Get the encoding configuration.
     pub const fn config(&self) -> (&Option<FramingConfig>, &SerializerConfig) {
         (&self.framing, &self.encoding.encoding)
+    }
+
+    /// Validates structural constraints on the encoding configuration that do not require
+    /// environment resources (like filesystem I/O or network access).
+    ///
+    /// This is called during config compilation so errors are reported on both
+    /// `vector validate --no-environment` and normal startup/reload.
+    pub fn validate_structure(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        self.encoding.validate_structure()
     }
 
     /// Build the `Framer` and `Serializer` for this config.

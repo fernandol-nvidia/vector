@@ -282,8 +282,8 @@ impl SinkConfig for HecLogsSinkConfig {
             errors.push(format!("batch: {e}"));
         }
 
-        // Validate encoding configuration (mirrors build_processor's encoding.build)
-        if let Err(e) = self.encoding.build() {
+        // Validate encoding configuration (structural checks only, no I/O)
+        if let Err(e) = self.encoding.validate_structure() {
             errors.push(format!("encoding: {e}"));
         }
 

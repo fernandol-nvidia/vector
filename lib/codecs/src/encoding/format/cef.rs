@@ -97,6 +97,31 @@ impl CefSerializerConfig {
         Self { cef }
     }
 
+    /// Validates structural constraints on the CEF serializer configuration.
+    ///
+    /// This is called during config compilation so errors are reported on both
+    /// `vector validate --no-environment` and normal startup/reload.
+    pub fn validate_structure(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        // Validate extension keys are ASCII alphabetical
+        let invalid_keys: Vec<String> = self
+            .cef
+            .extensions
+            .keys()
+            .filter(|key| !key.chars().all(|c| c.is_ascii_alphabetic()))
+            .cloned()
+            .collect();
+
+        if !invalid_keys.is_empty() {
+            return Err(format!(
+                "cef.extensions keys can only contain ASCII alphabetical characters: invalid key(s) '{}'" ,
+                invalid_keys.join(", ")
+            ).into());
+        }
+        Ok(())
+    }
+
     /// Build the `CefSerializer` from this configuration.
     pub fn build(&self) -> Result<CefSerializer, BuildError> {
         let device_vendor = validate_length(

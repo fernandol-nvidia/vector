@@ -50,6 +50,19 @@ impl CsvSerializerConfig {
         Self { csv }
     }
 
+    /// Validates structural constraints on the CSV serializer configuration.
+    ///
+    /// This is called during config compilation so errors are reported on both
+    /// `vector validate --no-environment` and normal startup/reload.
+    pub fn validate_structure(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        if self.csv.fields.is_empty() {
+            return Err("csv.fields must contain at least one field".into());
+        }
+        Ok(())
+    }
+
     /// Build the `CsvSerializer` from this configuration.
     pub fn build(&self) -> Result<CsvSerializer, BuildError> {
         if self.csv.fields.is_empty() {

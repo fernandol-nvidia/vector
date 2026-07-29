@@ -285,6 +285,57 @@ impl From<TextSerializerConfig> for SerializerConfig {
 }
 
 impl SerializerConfig {
+    /// Validates structural constraints on the serializer configuration that do not require
+    /// environment resources (like filesystem I/O or network access).
+    ///
+    /// This is called during config compilation so errors are reported on both
+    /// `vector validate --no-environment` and normal startup/reload.
+    ///
+    /// # Errors
+    ///
+    /// If validation does not succeed, an error is returned.
+    pub fn validate_structure(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        match self {
+            // Protobuf requires a valid message_type format but does NOT read the descriptor file.
+            // The descriptor file existence check is deferred to the actual build() call.
+            SerializerConfig::Protobuf(config) => {
+                // Validate message_type is not empty
+                if config.protobuf.message_type.is_empty() {
+                    return Err("protobuf.message_type must not be empty".into());
+                }
+                // Validate message_type has a valid format (package.Message)
+                // A valid protobuf message type should contain at least one dot separating package and message
+                if !config.protobuf.message_type.contains('.') {
+                    return Err(format!(
+                        "protobuf.message_type '{}' must be a fully qualified name (e.g., 'package.Message')",
+                        config.protobuf.message_type
+                    ).into());
+                }
+                // Validate desc_file is not empty (path validation without reading the file)
+                if config.protobuf.desc_file.as_os_str().is_empty() {
+                    return Err("protobuf.desc_file must not be empty".into());
+                }
+                Ok(())
+            }
+            // Avro schema is in config, no I/O required
+            SerializerConfig::Avro { avro } => {
+                if avro.schema.is_empty() {
+                    return Err("avro.schema must not be empty".into());
+                }
+                Ok(())
+            }
+            // CSV requires fields to be configured
+            SerializerConfig::Csv(config) => config.validate_structure(),
+            // CEF requires fields to be configured
+            SerializerConfig::Cef(config) => config.validate_structure(),
+            // All other serializers have no structural validation requirements
+            // that don't involve I/O or external resources
+            _ => Ok(()),
+        }
+    }
+
     /// Build the `Serializer` from this configuration.
     pub fn build(&self) -> Result<Serializer, Box<dyn std::error::Error + Send + Sync + 'static>> {
         match self {
@@ -622,6 +673,8 @@ impl tokio_util::codec::Encoder<Event> for Serializer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::ProtobufSerializerOptions;
+    use std::path::PathBuf;
 
     #[test]
     fn test_serializer_config_default() {
@@ -679,5 +732,105 @@ mod tests {
             native_config.default_stream_framing(),
             FramingConfig::LengthDelimited(_)
         ));
+    }
+
+    // Tests for validate_structure - structural validation without I/O
+
+    #[test]
+    fn test_protobuf_validate_structure_no_io_for_nonexistent_file() {
+        // This test proves that validate_structure does NOT perform filesystem I/O.
+        // If it did, this would fail because the descriptor file doesn't exist.
+
+        let config = ProtobufSerializerConfig {
+            protobuf: ProtobufSerializerOptions {
+                desc_file: PathBuf::from("/nonexistent/path/that/does/not/exist.desc"),
+                message_type: "package.Message".to_string(),
+                use_json_names: false,
+            },
+        };
+
+        // validate_structure should succeed - it only checks the format, not file existence
+        assert!(
+            config.validate_structure().is_ok(),
+            "validate_structure should not read the descriptor file"
+        );
+
+        // But build() would fail because the file doesn't exist
+        assert!(
+            config.build().is_err(),
+            "build() should fail because the file doesn't exist"
+        );
+    }
+
+    #[test]
+    fn test_protobuf_validate_structure_rejects_empty_message_type() {
+        let config = ProtobufSerializerConfig {
+            protobuf: ProtobufSerializerOptions {
+                desc_file: PathBuf::from("/some/path.desc"),
+                message_type: "".to_string(),
+                use_json_names: false,
+            },
+        };
+
+        let err = config.validate_structure().unwrap_err();
+        assert!(
+            err.to_string().contains("message_type"),
+            "error should mention message_type"
+        );
+    }
+
+    #[test]
+    fn test_protobuf_validate_structure_rejects_unqualified_message_type() {
+        let config = ProtobufSerializerConfig {
+            protobuf: ProtobufSerializerOptions {
+                desc_file: PathBuf::from("/some/path.desc"),
+                message_type: "MessageWithoutPackage".to_string(), // missing package prefix
+                use_json_names: false,
+            },
+        };
+
+        let err = config.validate_structure().unwrap_err();
+        assert!(
+            err.to_string().contains("fully qualified"),
+            "error should mention fully qualified: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_protobuf_validate_structure_rejects_empty_desc_file() {
+        let config = ProtobufSerializerConfig {
+            protobuf: ProtobufSerializerOptions {
+                desc_file: PathBuf::new(), // empty path
+                message_type: "package.Message".to_string(),
+                use_json_names: false,
+            },
+        };
+
+        let err = config.validate_structure().unwrap_err();
+        assert!(
+            err.to_string().contains("desc_file"),
+            "error should mention desc_file"
+        );
+    }
+
+    #[test]
+    fn test_encoding_config_validate_structure_for_protobuf() {
+        // Create a SerializerConfig with Protobuf serializer and nonexistent file
+        let protobuf_config = ProtobufSerializerConfig {
+            protobuf: ProtobufSerializerOptions {
+                desc_file: PathBuf::from("/nonexistent/path.desc"),
+                message_type: "package.Message".to_string(),
+                use_json_names: false,
+            },
+        };
+
+        let serializer_config = SerializerConfig::Protobuf(protobuf_config);
+
+        // validate_structure should succeed - no I/O is performed
+        assert!(
+            serializer_config.validate_structure().is_ok(),
+            "SerializerConfig::validate_structure should not perform I/O"
+        );
     }
 }

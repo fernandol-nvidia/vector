@@ -235,10 +235,21 @@ impl SinkConfig for RemoteWriteConfig {
         }
 
         #[cfg(feature = "aws-core")]
-        if let Some(PrometheusRemoteWriteAuth::Aws(_)) = &self.auth
-            && self.aws.is_none()
-        {
-            errors.push("aws configuration is required when using AWS authentication".to_string());
+        if let Some(PrometheusRemoteWriteAuth::Aws(_)) = &self.auth {
+            match &self.aws {
+                None => {
+                    errors.push(
+                        "aws configuration is required when using AWS authentication".to_string(),
+                    );
+                }
+                Some(aws_config) => {
+                    if aws_config.region.is_none() {
+                        errors.push(
+                            "aws.region is required when using AWS authentication".to_string(),
+                        );
+                    }
+                }
+            }
         }
 
         if errors.is_empty() {
@@ -517,6 +528,56 @@ mod tests {
             errors
                 .iter()
                 .any(|e| e.contains("scheme") && e.contains("http")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[cfg(feature = "aws-core")]
+    #[test]
+    fn validate_structure_rejects_aws_auth_without_aws_config() {
+        use crate::config::SinkConfig;
+        use crate::sinks::prometheus::PrometheusRemoteWriteAuth;
+
+        let config = RemoteWriteConfig {
+            endpoint: "https://localhost:8087/api/v1/write".to_string(),
+            auth: Some(PrometheusRemoteWriteAuth::Aws(
+                crate::aws::AwsAuthentication::default(),
+            )),
+            ..Default::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("aws configuration is required")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[cfg(feature = "aws-core")]
+    #[test]
+    fn validate_structure_rejects_aws_auth_without_region() {
+        use crate::config::SinkConfig;
+        use crate::sinks::prometheus::PrometheusRemoteWriteAuth;
+
+        let config = RemoteWriteConfig {
+            endpoint: "https://localhost:8087/api/v1/write".to_string(),
+            auth: Some(PrometheusRemoteWriteAuth::Aws(
+                crate::aws::AwsAuthentication::default(),
+            )),
+            aws: Some(crate::aws::RegionOrEndpoint {
+                region: None,
+                endpoint: Some("http://localhost:4566".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("aws.region is required")),
             "unexpected errors: {:?}",
             errors
         );

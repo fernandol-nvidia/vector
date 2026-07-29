@@ -345,9 +345,14 @@ impl SinkConfig for HttpSinkConfig {
             }
         }
 
+        // Validate encoding configuration (structural checks only, no I/O)
+        if let Err(e) = self.encoding.validate_structure() {
+            errors.push(format!("encoding: {e}"));
+        }
+
         // Validate payload wrapper for JSON encoding with comma-delimited framing
-        // Note: Skip encoder validation for encodings that require external files (e.g., Protobuf)
-        // as validate_structure is meant for config-level checks without I/O
+        // This requires building the encoder, but skip for encodings that need external files
+        // as those would perform I/O (validate_structure should not access the environment)
         let serializer = self.encoding.config().1;
         let needs_external_file = matches!(
             serializer,

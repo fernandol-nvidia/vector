@@ -285,9 +285,9 @@ impl SinkConfig for FileSinkConfig {
             errors.push(e.to_string());
         }
 
-        // Validate encoding configuration (e.g., CSV with empty fields list)
-        // Mirrors build() in FileSink::new()
-        if let Err(e) = self.encoding.build(SinkType::StreamBased) {
+        // Validate encoding configuration (structural checks only, no I/O)
+        // This checks message_type format for Protobuf without reading the descriptor file.
+        if let Err(e) = self.encoding.validate_structure() {
             errors.push(format!("encoding: {}", e));
         }
 

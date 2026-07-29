@@ -464,8 +464,8 @@ impl SinkConfig for PulsarSinkConfig {
             errors.push(e.to_string());
         }
 
-        // Validate encoding configuration (mirrors PulsarSink::new check)
-        if let Err(e) = self.encoding.build() {
+        // Validate encoding configuration (structural checks only, no I/O)
+        if let Err(e) = self.encoding.validate_structure() {
             errors.push(format!("encoding: {e}"));
         }
 

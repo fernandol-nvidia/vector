@@ -262,6 +262,11 @@ impl SinkConfig for GreptimeDBLogsConfig {
             errors.push(e.to_string());
         }
 
+        // Validate batch settings (mirrors self.batch.into_batcher_settings()? in build())
+        if let Err(e) = self.batch.validate() {
+            errors.push(format!("batch: {e}"));
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {

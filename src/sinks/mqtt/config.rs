@@ -166,6 +166,11 @@ impl SinkConfig for MqttSinkConfig {
             errors.push(e.to_string());
         }
 
+        // Validate encoding configuration
+        if let Err(e) = self.encoding.build() {
+            errors.push(format!("encoding: {}", e));
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {

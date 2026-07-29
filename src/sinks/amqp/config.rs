@@ -169,6 +169,11 @@ impl SinkConfig for AmqpSinkConfig {
             errors.push("max_channels must be positive".to_string());
         }
 
+        // Validate encoding configuration (mirrors AmqpSink::new check)
+        if let Err(e) = self.encoding.build() {
+            errors.push(format!("encoding: {e}"));
+        }
+
         if let Err(e) = self
             .exchange
             .clone()

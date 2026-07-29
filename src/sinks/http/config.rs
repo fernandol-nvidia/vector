@@ -286,11 +286,20 @@ impl SinkConfig for HttpSinkConfig {
             errors.push(e.to_string());
         }
 
-        // Validate static URIs can be parsed
-        if !self.uri.is_dynamic()
-            && let Err(e) = self.uri.get_ref().parse::<http::Uri>()
-        {
-            errors.push(format!("uri: invalid URI: {e}"));
+        // Validate static URIs can be parsed and check for duplicate credentials
+        if !self.uri.is_dynamic() {
+            // Parse as UriSerde to extract any embedded auth
+            match self.uri.get_ref().parse::<UriSerde>() {
+                Ok(uri_serde) => {
+                    // Check for duplicate credentials (auth in URI + auth in config)
+                    if let Err(e) = self.auth.choose_one(&uri_serde.auth) {
+                        errors.push(format!("auth: {e}"));
+                    }
+                }
+                Err(e) => {
+                    errors.push(format!("uri: invalid URI: {e}"));
+                }
+            }
         }
 
         // Validate headers (both static and template values)
@@ -789,6 +798,42 @@ mod tests {
             errors
                 .iter()
                 .any(|e| e.contains("payload_prefix") || e.contains("payload_suffix")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_duplicate_credentials() {
+        // URI with embedded basic auth, plus auth configured
+        let config = HttpSinkConfig {
+            uri: Template::try_from("https://user:pass@example.com/endpoint").unwrap(),
+            method: HttpMethod::default(),
+            encoding: EncodingConfigWithFraming::new(
+                None,
+                JsonSerializerConfig::new(MetricTagValues::Full, JsonSerializerOptions::default())
+                    .into(),
+                Transformer::default(),
+            ),
+            auth: Some(crate::http::Auth::Bearer {
+                token: "test".to_string().into(),
+            }),
+            compression: Compression::default(),
+            batch: BatchConfig::default(),
+            request: RequestConfig::default(),
+            tls: None,
+            acknowledgements: AcknowledgementsConfig::default(),
+            payload_prefix: String::new(),
+            payload_suffix: String::new(),
+            retry_strategy: RetryStrategy::default(),
+            confinement: ConfinementConfig::default(),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("authorization") || e.contains("credentials")),
             "unexpected errors: {:?}",
             errors
         );

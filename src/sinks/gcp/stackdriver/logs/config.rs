@@ -352,6 +352,15 @@ impl SinkConfig for StackdriverConfig {
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
+        // Validate batch settings (max_bytes must not exceed 10MB API limit)
+        if let Err(e) = self
+            .batch
+            .validate()
+            .and_then(|b| b.limit_max_bytes(MAX_BATCH_PAYLOAD_SIZE))
+        {
+            errors.push(format!("batch: {e}"));
+        }
+
         // Validate log_id confinement
         if let Err(e) = self
             .log_id

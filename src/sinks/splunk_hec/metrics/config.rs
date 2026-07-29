@@ -221,6 +221,12 @@ impl SinkConfig for HecMetricsSinkConfig {
             errors.push(e.to_string());
         }
 
+        // Validate batch settings before building the sink
+        // (mirrors build_processor's self.batch.into_batcher_settings())
+        if let Err(e) = self.batch.validate() {
+            errors.push(format!("batch: {e}"));
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {

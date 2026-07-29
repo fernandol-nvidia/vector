@@ -253,6 +253,14 @@ impl SinkConfig for RedisSinkConfig {
             }
         }
 
+        // Validate batch settings (mirrors RedisSink::new check)
+        if let Err(e) = self.batch.validate() {
+            errors.push(format!("batch: {e}"));
+        }
+        if let Err(e) = self.batch.into_batcher_settings() {
+            errors.push(format!("batch: {e}"));
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {

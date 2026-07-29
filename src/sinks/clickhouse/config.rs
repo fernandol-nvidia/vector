@@ -325,6 +325,22 @@ impl SinkConfig for ClickhouseConfig {
             }
         }
 
+        // Validate endpoint has a host
+        let endpoint = self.endpoint.with_default_parts();
+        if endpoint.uri.host().is_none() {
+            errors.push("endpoint must include a host".to_string());
+        }
+
+        // Check for duplicate credentials (auth + endpoint.auth)
+        if let Err(e) = self.auth.choose_one(&self.endpoint.auth) {
+            errors.push(format!("auth: {e}"));
+        }
+
+        // Validate batch settings
+        if let Err(e) = self.batch.into_batcher_settings() {
+            errors.push(format!("batch: {e}"));
+        }
+
         if let Err(e) = self
             .table
             .clone()
@@ -723,5 +739,77 @@ mod tests {
         };
 
         config.validate_structure().unwrap();
+    }
+
+    #[test]
+    fn validate_structure_rejects_missing_host() {
+        use crate::config::SinkConfig;
+
+        let config = ClickhouseConfig {
+            endpoint: "/path".parse::<http::Uri>().unwrap().into(),
+            table: "test_table".try_into().unwrap(),
+            ..Default::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("endpoint must include a host")),
+            "expected host error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_duplicate_credentials() {
+        use crate::config::SinkConfig;
+        use crate::http::Auth;
+        use vector_lib::sensitive_string::SensitiveString;
+
+        let config = ClickhouseConfig {
+            endpoint: "http://user:pass@localhost:8123"
+                .parse::<http::Uri>()
+                .unwrap()
+                .into(),
+            table: "test_table".try_into().unwrap(),
+            auth: Some(Auth::Basic {
+                user: "other".to_string(),
+                password: SensitiveString::from("creds".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("auth") && e.contains("choose")),
+            "expected duplicate auth error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_invalid_batch_settings() {
+        use crate::config::SinkConfig;
+        use crate::sinks::util::batch::BatchConfig;
+
+        let mut batch = BatchConfig::default();
+        batch.max_events = Some(0);
+
+        let config = ClickhouseConfig {
+            endpoint: "http://localhost:8123".parse::<http::Uri>().unwrap().into(),
+            table: "test_table".try_into().unwrap(),
+            batch,
+            ..Default::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("batch")),
+            "expected batch error, got: {:?}",
+            errors
+        );
     }
 }

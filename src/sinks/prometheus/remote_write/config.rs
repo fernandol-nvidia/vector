@@ -213,6 +213,11 @@ impl SinkConfig for RemoteWriteConfig {
             errors.push(e.to_string());
         }
 
+        // Validate batch settings (mirrors build() call to validate/into_batcher_settings)
+        if let Err(e) = self.batch.batch_settings.validate() {
+            errors.push(format!("batch: {e}"));
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {

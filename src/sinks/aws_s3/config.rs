@@ -283,6 +283,11 @@ impl SinkConfig for S3SinkConfig {
             }
         }
 
+        // Validate batch settings.
+        if let Err(e) = self.batch.validate() {
+            errors.push(format!("batch: {e}"));
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {

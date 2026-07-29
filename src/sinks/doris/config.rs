@@ -4,7 +4,7 @@ use super::sink::DorisSink;
 
 use crate::{
     codecs::EncodingConfigWithFraming,
-    http::{Auth, HttpClient},
+    http::{Auth, HttpClient, MaybeAuth},
     sinks::{
         doris::{
             client::DorisSinkClient, common::DorisCommon, health::DorisHealthLogic,
@@ -261,6 +261,23 @@ impl SinkConfig for DorisConfig {
 
         if self.endpoints.is_empty() {
             errors.push("No endpoints configured.".to_string());
+        } else {
+            // Check each endpoint has a host and no auth conflict
+            for endpoint in &self.endpoints {
+                if endpoint.uri.host().is_none() {
+                    errors.push(format!(
+                        "Invalid endpoint: {}, host must include hostname",
+                        endpoint.uri
+                    ));
+                }
+                if let Err(e) = self.auth.choose_one(&endpoint.auth) {
+                    errors.push(format!("auth conflict: {e}"));
+                }
+            }
+        }
+
+        if let Err(e) = self.batch.validate() {
+            errors.push(format!("batch: {e}"));
         }
 
         if let Err(e) = self
@@ -352,6 +369,49 @@ mod tests {
             errors[0].contains("endpoints"),
             "unexpected error: {:?}",
             errors[0]
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_hostless_endpoint() {
+        use crate::sinks::util::UriSerde;
+
+        let config = DorisConfig {
+            endpoints: vec!["/stream_load".parse::<UriSerde>().unwrap()],
+            ..Default::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("host must include hostname")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_duplicate_credentials() {
+        use crate::http::Auth;
+        use crate::sinks::util::UriSerde;
+        use vector_lib::sensitive_string::SensitiveString;
+
+        let endpoint: UriSerde = "http://user:pass@doris.example.com:8030".parse().unwrap();
+        let config = DorisConfig {
+            endpoints: vec![endpoint],
+            auth: Some(Auth::Basic {
+                user: "other".to_string(),
+                password: SensitiveString::from("creds".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("auth conflict")),
+            "unexpected errors: {:?}",
+            errors
         );
     }
 }

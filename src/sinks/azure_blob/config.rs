@@ -291,6 +291,8 @@ impl SinkConfig for AzureBlobSinkConfig {
     }
 
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        use crate::sinks::azure_common::connection_string::ParsedConnectionString;
+
         let mut errors = Vec::new();
 
         // Mirror credential shape checks from build()
@@ -327,12 +329,42 @@ impl SinkConfig for AzureBlobSinkConfig {
             _ => {}
         }
 
+        // Parse connection_string to catch malformed strings early
+        // (mirrors ParsedConnectionString::parse in build_client)
+        if let Some(connstr) = &self.connection_string {
+            if let Err(e) = ParsedConnectionString::parse(connstr.inner()) {
+                errors.push(format!("connection_string: invalid format: {e}"));
+            }
+            // Check for duplicate auth: connection_string auth + auth field
+            if self.auth.is_some() {
+                // Re-parse to check auth type
+                if let Ok(parsed) = ParsedConnectionString::parse(connstr.inner()) {
+                    match parsed.auth() {
+                        crate::sinks::azure_common::connection_string::Auth::SharedKey {
+                            ..
+                        }
+                        | crate::sinks::azure_common::connection_string::Auth::Sas { .. } => {
+                            errors.push(
+                                "Cannot use both `connection_string` with embedded credentials and `auth`".to_string(),
+                            );
+                        }
+                        crate::sinks::azure_common::connection_string::Auth::None => {}
+                    }
+                }
+            }
+        }
+
         if let Err(e) =
             self.blob_prefix
                 .clone()
                 .confine(&self.confinement, Self::NAME, "blob_prefix")
         {
             errors.push(e.to_string());
+        }
+
+        // Validate batch settings (mirrors build_processor's into_batcher_settings)
+        if let Err(e) = self.batch.into_batcher_settings() {
+            errors.push(format!("batch: {e}"));
         }
 
         if errors.is_empty() {

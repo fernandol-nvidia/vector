@@ -277,6 +277,11 @@ impl SinkConfig for HecLogsSinkConfig {
             errors.push(e.to_string());
         }
 
+        // Validate batch settings (mirrors build_processor's into_batcher_settings call)
+        if let Err(e) = self.batch.into_batcher_settings() {
+            errors.push(format!("batch: {e}"));
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {

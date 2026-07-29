@@ -336,7 +336,25 @@ impl SinkConfig for GcsSinkConfig {
                 if let Err(e) = HeaderValue::from_str(value) {
                     errors.push(format!("metadata.{name}: invalid header value: {e}"));
                 }
+                // Validate metadata key as header name
+                if let Err(e) = HeaderName::from_bytes(name.as_bytes()) {
+                    errors.push(format!("metadata.{name}: invalid header name: {e}"));
+                }
             }
+        }
+
+        // Validate endpoint URL parses correctly
+        // build_sink() calls base_url.parse::<Uri>().unwrap() after formatting
+        let base_url = format!("{}/{}/", self.endpoint, self.bucket);
+        if let Err(e) = base_url.parse::<Uri>() {
+            errors.push(format!(
+                "endpoint: invalid URL after combining with bucket: {e}"
+            ));
+        }
+
+        // Validate batch settings
+        if let Err(e) = self.batch.validate() {
+            errors.push(format!("batch: {e}"));
         }
 
         if errors.is_empty() {
@@ -965,5 +983,43 @@ mod tests {
         };
 
         config.validate_structure().unwrap();
+    }
+
+    #[test]
+    fn validate_structure_rejects_invalid_metadata_key() {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("bad\nkey".to_string(), "value".to_string());
+
+        let config = GcsSinkConfig {
+            metadata: Some(metadata),
+            ..default_config((None::<FramingConfig>, TextSerializerConfig::default()).into())
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("metadata.bad\nkey") && e.contains("invalid header name")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_invalid_endpoint() {
+        let config = GcsSinkConfig {
+            endpoint: "http://%".to_string(),
+            bucket: "my-bucket".to_string(),
+            ..default_config((None::<FramingConfig>, TextSerializerConfig::default()).into())
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("endpoint") && e.contains("invalid URL")),
+            "unexpected errors: {:?}",
+            errors
+        );
     }
 }

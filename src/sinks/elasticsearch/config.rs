@@ -808,6 +808,57 @@ impl SinkConfig for ElasticsearchConfig {
             _ => {}
         }
 
+        // Parse endpoints and check for host + auth conflicts
+        for endpoint in self.endpoints.iter().chain(self.endpoint.iter()) {
+            // Check that endpoint parses as UriSerde (which extracts auth)
+            match endpoint.parse::<crate::sinks::util::UriSerde>() {
+                Err(e) => errors.push(format!("endpoint '{endpoint}': invalid URI: {e}")),
+                Ok(uri) => {
+                    if uri.uri.host().is_none() {
+                        errors.push(format!("endpoint '{endpoint}': must include hostname"));
+                    }
+                    // Check for auth in URI conflicting with config auth
+                    if uri.auth.is_some() && self.auth.is_some() {
+                        errors.push(
+                            "endpoint contains credentials and `auth` is also configured"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Validate batch settings
+        if let Err(e) = self.batch.validate() {
+            errors.push(format!("batch: {e}"));
+        }
+
+        // Validate bulk versioning constraints
+        if self.bulk.version.is_some() && self.bulk.version_type == VersionType::Internal {
+            errors.push(
+                "bulk.version will be ignored because bulk.version_type is 'internal'".to_string(),
+            );
+        }
+        if self.bulk.version.is_some()
+            && (self.bulk.version_type == VersionType::External
+                || self.bulk.version_type == VersionType::ExternalGte)
+            && self.id_key.is_none()
+        {
+            errors.push(
+                "bulk.version_type 'external' or 'external_gte' requires id_key to be set"
+                    .to_string(),
+            );
+        }
+        if self.bulk.version.is_none()
+            && (self.bulk.version_type == VersionType::External
+                || self.bulk.version_type == VersionType::ExternalGte)
+        {
+            errors.push(
+                "bulk.version_type 'external' or 'external_gte' requires bulk.version to be set"
+                    .to_string(),
+            );
+        }
+
         // Validate the active mode's routing templates.
         // This mirrors the confinement logic in common_mode().
         match self.mode {
@@ -1133,6 +1184,112 @@ mod tests {
         let errors = config.validate_structure().unwrap_err();
         assert!(
             errors.iter().any(|e| e.contains("mutually exclusive")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_endpoint_without_host() {
+        use crate::config::SinkConfig;
+
+        let config = ElasticsearchConfig {
+            endpoints: vec!["/bulk".to_string()],
+            ..ElasticsearchConfig::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("must include hostname")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_duplicate_auth() {
+        use crate::config::SinkConfig;
+        use vector_lib::sensitive_string::SensitiveString;
+
+        let config = ElasticsearchConfig {
+            endpoints: vec!["http://user:pass@localhost:9200".to_string()],
+            auth: Some(ElasticsearchAuthConfig::Basic {
+                user: "other".to_string(),
+                password: SensitiveString::from("secret".to_string()),
+            }),
+            ..ElasticsearchConfig::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("credentials") && e.contains("auth")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_external_version_without_id_key() {
+        use crate::config::SinkConfig;
+
+        let config = ElasticsearchConfig {
+            endpoints: vec!["http://localhost:9200".to_string()],
+            bulk: BulkConfig {
+                version: Some(UnconfinedTemplate::try_from("1").unwrap()),
+                version_type: VersionType::External,
+                ..BulkConfig::default()
+            },
+            ..ElasticsearchConfig::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("id_key")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_external_version_type_without_version() {
+        use crate::config::SinkConfig;
+
+        let config = ElasticsearchConfig {
+            endpoints: vec!["http://localhost:9200".to_string()],
+            bulk: BulkConfig {
+                version_type: VersionType::External,
+                ..BulkConfig::default()
+            },
+            ..ElasticsearchConfig::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("version")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_version_with_internal_type() {
+        use crate::config::SinkConfig;
+
+        let config = ElasticsearchConfig {
+            endpoints: vec!["http://localhost:9200".to_string()],
+            bulk: BulkConfig {
+                version: Some(UnconfinedTemplate::try_from("1").unwrap()),
+                version_type: VersionType::Internal,
+                ..BulkConfig::default()
+            },
+            ..ElasticsearchConfig::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("ignored")),
             "unexpected errors: {:?}",
             errors
         );

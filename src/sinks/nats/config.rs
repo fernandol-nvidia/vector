@@ -222,6 +222,21 @@ impl SinkConfig for NatsSinkConfig {
             errors.push(format!("url: {}", e));
         }
 
+        // Validate TLS key/cert pairing when TLS is enabled
+        if let Some(tls) = &self.tls
+            && tls.enabled.unwrap_or(false)
+        {
+            match (&tls.options.crt_file, &tls.options.key_file) {
+                (Some(_), None) => {
+                    errors.push("tls: key_file is required when crt_file is set".to_string());
+                }
+                (None, Some(_)) => {
+                    errors.push("tls: crt_file is required when key_file is set".to_string());
+                }
+                _ => {}
+            }
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -406,6 +421,134 @@ mod tests {
             encoding: JsonSerializerConfig::default().into(),
             subject: Template::try_from("events").unwrap(),
             tls: None,
+            url: "nats://localhost:4222".into(),
+            request: Default::default(),
+            jetstream: Default::default(),
+            confinement: ConfinementConfig::default(),
+        };
+
+        config.validate_structure().unwrap();
+    }
+
+    #[test]
+    fn validate_structure_rejects_tls_with_crt_but_no_key() {
+        use crate::config::SinkConfig;
+        use std::path::PathBuf;
+        use vector_lib::tls::TlsConfig;
+
+        let config = super::NatsSinkConfig {
+            acknowledgements: Default::default(),
+            auth: None,
+            connection_name: "vector".into(),
+            encoding: JsonSerializerConfig::default().into(),
+            subject: Template::try_from("events").unwrap(),
+            tls: Some(vector_lib::tls::TlsEnableableConfig {
+                enabled: Some(true),
+                options: TlsConfig {
+                    crt_file: Some(PathBuf::from("/path/to/cert.pem")),
+                    key_file: None,
+                    ..Default::default()
+                },
+            }),
+            url: "nats://localhost:4222".into(),
+            request: Default::default(),
+            jetstream: Default::default(),
+            confinement: ConfinementConfig::default(),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("key_file")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_tls_with_key_but_no_crt() {
+        use crate::config::SinkConfig;
+        use std::path::PathBuf;
+        use vector_lib::tls::TlsConfig;
+
+        let config = super::NatsSinkConfig {
+            acknowledgements: Default::default(),
+            auth: None,
+            connection_name: "vector".into(),
+            encoding: JsonSerializerConfig::default().into(),
+            subject: Template::try_from("events").unwrap(),
+            tls: Some(vector_lib::tls::TlsEnableableConfig {
+                enabled: Some(true),
+                options: TlsConfig {
+                    crt_file: None,
+                    key_file: Some(PathBuf::from("/path/to/key.pem")),
+                    ..Default::default()
+                },
+            }),
+            url: "nats://localhost:4222".into(),
+            request: Default::default(),
+            jetstream: Default::default(),
+            confinement: ConfinementConfig::default(),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("crt_file")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_allows_tls_with_both_crt_and_key() {
+        use crate::config::SinkConfig;
+        use std::path::PathBuf;
+        use vector_lib::tls::TlsConfig;
+
+        let config = super::NatsSinkConfig {
+            acknowledgements: Default::default(),
+            auth: None,
+            connection_name: "vector".into(),
+            encoding: JsonSerializerConfig::default().into(),
+            subject: Template::try_from("events").unwrap(),
+            tls: Some(vector_lib::tls::TlsEnableableConfig {
+                enabled: Some(true),
+                options: TlsConfig {
+                    crt_file: Some(PathBuf::from("/path/to/cert.pem")),
+                    key_file: Some(PathBuf::from("/path/to/key.pem")),
+                    ..Default::default()
+                },
+            }),
+            url: "nats://localhost:4222".into(),
+            request: Default::default(),
+            jetstream: Default::default(),
+            confinement: ConfinementConfig::default(),
+        };
+
+        config.validate_structure().unwrap();
+    }
+
+    #[test]
+    fn validate_structure_allows_tls_disabled_with_partial_config() {
+        use crate::config::SinkConfig;
+        use std::path::PathBuf;
+        use vector_lib::tls::TlsConfig;
+
+        // When tls.enabled = false (or unset), partial crt/key config should be allowed
+        // since it won't be used anyway
+        let config = super::NatsSinkConfig {
+            acknowledgements: Default::default(),
+            auth: None,
+            connection_name: "vector".into(),
+            encoding: JsonSerializerConfig::default().into(),
+            subject: Template::try_from("events").unwrap(),
+            tls: Some(vector_lib::tls::TlsEnableableConfig {
+                enabled: Some(false),
+                options: TlsConfig {
+                    crt_file: Some(PathBuf::from("/path/to/cert.pem")),
+                    key_file: None,
+                    ..Default::default()
+                },
+            }),
             url: "nats://localhost:4222".into(),
             request: Default::default(),
             jetstream: Default::default(),

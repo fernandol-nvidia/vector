@@ -285,6 +285,12 @@ impl SinkConfig for FileSinkConfig {
             errors.push(e.to_string());
         }
 
+        // Validate encoding configuration (e.g., CSV with empty fields list)
+        // Mirrors build() in FileSink::new()
+        if let Err(e) = self.encoding.build(SinkType::StreamBased) {
+            errors.push(format!("encoding: {}", e));
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {

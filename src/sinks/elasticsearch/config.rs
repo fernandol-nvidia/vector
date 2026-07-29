@@ -866,7 +866,8 @@ impl SinkConfig for ElasticsearchConfig {
             match &self.auth {
                 Some(ElasticsearchAuthConfig::Aws(_)) => (),
                 _ => errors.push(
-                    "opensearch_service_type 'serverless' requires 'auth' to be set to 'aws'".to_string()
+                    "opensearch_service_type 'serverless' requires 'auth' to be set to 'aws'"
+                        .to_string(),
                 ),
             }
             #[cfg(not(feature = "aws-core"))]
@@ -876,7 +877,8 @@ impl SinkConfig for ElasticsearchConfig {
 
             if self.api_version != ElasticsearchApiVersion::Auto {
                 errors.push(
-                    "opensearch_service_type 'serverless' requires api_version to be 'auto'".to_string()
+                    "opensearch_service_type 'serverless' requires api_version to be 'auto'"
+                        .to_string(),
                 );
             }
         }
@@ -1330,7 +1332,9 @@ mod tests {
 
         let errors = config.validate_structure().unwrap_err();
         assert!(
-            errors.iter().any(|e| e.contains("serverless") && e.contains("aws")),
+            errors
+                .iter()
+                .any(|e| e.contains("serverless") && e.contains("aws")),
             "unexpected errors: {:?}",
             errors
         );
@@ -1349,7 +1353,9 @@ mod tests {
 
         let errors = config.validate_structure().unwrap_err();
         assert!(
-            errors.iter().any(|e| e.contains("serverless") && e.contains("api_version")),
+            errors
+                .iter()
+                .any(|e| e.contains("serverless") && e.contains("api_version")),
             "unexpected errors: {:?}",
             errors
         );

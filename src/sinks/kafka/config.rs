@@ -408,7 +408,8 @@ mod tests {
         use crate::config::SinkConfig;
         use std::collections::HashMap;
 
-        let mut config: KafkaSinkConfig = serde_json::from_value(KafkaSinkConfig::generate_config()).unwrap();
+        let mut config: KafkaSinkConfig =
+            serde_json::from_value(KafkaSinkConfig::generate_config()).unwrap();
         config.batch.timeout_secs = Some(5.0);
         config.librdkafka_options =
             HashMap::from_iter([("queue.buffering.max.ms".to_string(), "1000".to_string())]);
@@ -428,7 +429,8 @@ mod tests {
         use crate::config::SinkConfig;
         use std::collections::HashMap;
 
-        let mut config: KafkaSinkConfig = serde_json::from_value(KafkaSinkConfig::generate_config()).unwrap();
+        let mut config: KafkaSinkConfig =
+            serde_json::from_value(KafkaSinkConfig::generate_config()).unwrap();
         config.batch.max_events = Some(100);
         config.librdkafka_options =
             HashMap::from_iter([("batch.num.messages".to_string(), "50".to_string())]);
@@ -448,7 +450,8 @@ mod tests {
         use crate::config::SinkConfig;
         use std::collections::HashMap;
 
-        let mut config: KafkaSinkConfig = serde_json::from_value(KafkaSinkConfig::generate_config()).unwrap();
+        let mut config: KafkaSinkConfig =
+            serde_json::from_value(KafkaSinkConfig::generate_config()).unwrap();
         config.batch.max_bytes = Some(1024);
         config.librdkafka_options =
             HashMap::from_iter([("batch.size".to_string(), "512".to_string())]);
@@ -467,7 +470,8 @@ mod tests {
     fn validate_structure_allows_batch_without_conflict() {
         use crate::config::SinkConfig;
 
-        let mut config: KafkaSinkConfig = serde_json::from_value(KafkaSinkConfig::generate_config()).unwrap();
+        let mut config: KafkaSinkConfig =
+            serde_json::from_value(KafkaSinkConfig::generate_config()).unwrap();
         config.batch.timeout_secs = Some(5.0);
         config.batch.max_events = Some(100);
         config.batch.max_bytes = Some(1024);

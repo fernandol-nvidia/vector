@@ -202,7 +202,8 @@ impl SinkConfig for RemoteWriteConfig {
             Ok(uri) => {
                 // Validate endpoint has scheme and host (absolute URI)
                 if uri.scheme().is_none() {
-                    errors.push("endpoint: must include a scheme (http:// or https://)".to_string());
+                    errors
+                        .push("endpoint: must include a scheme (http:// or https://)".to_string());
                 }
                 if uri.host().is_none() {
                     errors.push("endpoint: must include a host".to_string());

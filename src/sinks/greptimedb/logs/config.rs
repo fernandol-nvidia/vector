@@ -325,7 +325,7 @@ mod tests {
         use crate::config::SinkConfig;
 
         let config = GreptimeDBLogsConfig {
-            endpoint: "localhost:4000".to_string(),
+            endpoint: "http://".to_string(),
             ..GreptimeDBLogsConfig::default()
         };
 

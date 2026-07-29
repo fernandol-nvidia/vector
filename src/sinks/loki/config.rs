@@ -263,6 +263,14 @@ impl SinkConfig for LokiConfig {
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
+        // Check for duplicate credentials (mirrors build() check)
+        if self.auth.is_some() && self.endpoint.auth.is_some() {
+            errors.push(
+                "Both `auth` and credentials in `endpoint` URL are set. Only one can be used."
+                    .to_string(),
+            );
+        }
+
         // Check for empty labels (mirrors build() check)
         if self.labels.is_empty() {
             errors.push("`labels` must include at least one label.".to_string());
@@ -459,6 +467,43 @@ labels = {"static_label" = "static_value"}
         let errors = config.validate_structure().unwrap_err();
         assert!(
             errors.iter().any(|e| e.contains("Invalid label name")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_duplicate_credentials() {
+        use super::LokiConfig;
+        use crate::config::SinkConfig;
+        use crate::http::Auth;
+        use crate::sinks::util::UriSerde;
+
+        let label_config = toml::from_str::<LokiConfig>(
+            r#"
+endpoint = "http://localhost:3100"
+encoding.codec = "text"
+labels = {"static_label" = "static_value"}
+"#,
+        )
+        .unwrap();
+
+        let config = LokiConfig {
+            endpoint: "http://user:pass@localhost:3100"
+                .parse::<UriSerde>()
+                .unwrap(),
+            auth: Some(Auth::Basic {
+                user: "otheruser".to_string(),
+                password: "otherpass".to_string().into(),
+            }),
+            ..label_config
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("auth") && e.contains("endpoint")),
             "unexpected errors: {:?}",
             errors
         );

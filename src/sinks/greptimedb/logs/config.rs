@@ -225,6 +225,12 @@ impl SinkConfig for GreptimeDBLogsConfig {
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
+        // Parse endpoint URL to catch malformed endpoints early
+        // (mirrors url::Url::parse in prepare_log_ingester_url)
+        if let Err(e) = url::Url::parse(&self.endpoint) {
+            errors.push(format!("endpoint: invalid URL: {e}"));
+        }
+
         if let Err(e) = self
             .table
             .clone()
@@ -266,6 +272,7 @@ impl SinkConfig for GreptimeDBLogsConfig {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::template::{ConfinementConfig, Template};
 
     #[test]
@@ -292,5 +299,55 @@ mod tests {
         let config = ConfinementConfig::default();
         let result = template.confine(&config, "greptimedb_logs", "table");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_structure_rejects_invalid_endpoint() {
+        use crate::config::SinkConfig;
+
+        let config = GreptimeDBLogsConfig {
+            endpoint: "not a valid url".to_string(),
+            ..GreptimeDBLogsConfig::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("endpoint") && e.contains("invalid URL")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_endpoint_missing_scheme() {
+        use crate::config::SinkConfig;
+
+        let config = GreptimeDBLogsConfig {
+            endpoint: "localhost:4000".to_string(),
+            ..GreptimeDBLogsConfig::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("endpoint") && e.contains("invalid URL")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_allows_valid_endpoint() {
+        use crate::config::SinkConfig;
+
+        let config = GreptimeDBLogsConfig {
+            endpoint: "http://localhost:4000".to_string(),
+            ..GreptimeDBLogsConfig::default()
+        };
+
+        config.validate_structure().unwrap();
     }
 }

@@ -307,6 +307,20 @@ impl SinkConfig for HttpSinkConfig {
             }
         }
 
+        // Validate payload wrapper for JSON encoding with comma-delimited framing
+        match self.build_encoder() {
+            Ok(encoder) => {
+                if let Err(e) =
+                    validate_payload_wrapper(&self.payload_prefix, &self.payload_suffix, &encoder)
+                {
+                    errors.push(format!("payload_prefix/payload_suffix: {e}"));
+                }
+            }
+            Err(e) => {
+                errors.push(format!("encoding: {e}"));
+            }
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -731,6 +745,50 @@ mod tests {
         let errors = config.validate_structure().unwrap_err();
         assert!(
             errors.iter().any(|e| e.contains("batch")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_invalid_payload_wrapper() {
+        use crate::codecs::Transformer;
+        use vector_lib::codecs::encoding::FramingConfig;
+        use vector_lib::codecs::encoding::format::JsonSerializerOptions;
+        use vector_lib::codecs::{CharacterDelimitedEncoderConfig, JsonSerializerConfig};
+
+        // JSON serializer with character-delimited (comma) framing
+        // This combination triggers payload wrapper validation
+        let encoding = EncodingConfigWithFraming::new(
+            Some(FramingConfig::CharacterDelimited(
+                CharacterDelimitedEncoderConfig::new(b','),
+            )),
+            JsonSerializerConfig::new(MetricTagValues::Full, JsonSerializerOptions::default())
+                .into(),
+            Transformer::default(),
+        );
+
+        let config = HttpSinkConfig {
+            uri: Template::try_from("https://example.com").unwrap(),
+            method: HttpMethod::default(),
+            encoding,
+            auth: None,
+            compression: Compression::default(),
+            batch: BatchConfig::default(),
+            request: RequestConfig::default(),
+            tls: None,
+            acknowledgements: AcknowledgementsConfig::default(),
+            payload_prefix: "{\"data\":".to_string(), // invalid: needs closing brace
+            payload_suffix: String::new(),
+            retry_strategy: RetryStrategy::default(),
+            confinement: ConfinementConfig::default(),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("payload_prefix") || e.contains("payload_suffix")),
             "unexpected errors: {:?}",
             errors
         );

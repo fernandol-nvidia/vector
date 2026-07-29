@@ -262,6 +262,11 @@ impl SinkConfig for CloudwatchLogsSinkConfig {
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
+        // Validate batch settings
+        if let Err(e) = self.batch.validate() {
+            errors.push(format!("batch: {e}"));
+        }
+
         if let Err(e) = self
             .group_name
             .clone()
@@ -357,5 +362,27 @@ mod tests {
         let config = ConfinementConfig::default();
         let result = template.confine(&config, "aws_cloudwatch_logs", "group_name");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_structure_rejects_invalid_batch_settings() {
+        use crate::config::SinkConfig;
+        use crate::sinks::util::batch::BatchConfig;
+        use vector_lib::codecs::JsonSerializerConfig;
+
+        let mut batch = BatchConfig::default();
+        batch.max_events = Some(0);
+
+        let config = super::CloudwatchLogsSinkConfig {
+            batch,
+            ..super::default_config(JsonSerializerConfig::default().into())
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("batch")),
+            "unexpected errors: {:?}",
+            errors
+        );
     }
 }

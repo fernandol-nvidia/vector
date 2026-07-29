@@ -428,6 +428,34 @@ impl SinkConfig for PulsarSinkConfig {
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
+        // Validate auth configuration shape (mirrors create_pulsar_client)
+        if let Some(auth) = &self.auth {
+            match (
+                auth.name.as_ref(),
+                auth.token.as_ref(),
+                auth.oauth2.as_ref(),
+            ) {
+                (Some(_), Some(_), None) => { /* valid: name + token */ }
+                (None, None, Some(_)) => { /* valid: oauth2 only */ }
+                (None, None, None) => {
+                    errors.push(
+                        "auth configuration is present but empty. Provide either 'name' and 'token' or 'oauth2' configuration.".to_string()
+                    );
+                }
+                (Some(_), None, None) => {
+                    errors.push("auth.name requires auth.token to be set.".to_string());
+                }
+                (None, Some(_), None) => {
+                    errors.push("auth.token requires auth.name to be set.".to_string());
+                }
+                _ => {
+                    errors.push(
+                        "Invalid auth config: can only specify name and token or oauth2 configuration, not both.".to_string()
+                    );
+                }
+            }
+        }
+
         if let Err(e) = self
             .topic
             .clone()
@@ -472,5 +500,148 @@ mod tests {
         let config = ConfinementConfig::default();
         let result = template.confine(&config, "pulsar", "topic");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_structure_rejects_empty_auth() {
+        use crate::config::SinkConfig;
+        use crate::sinks::pulsar::config::PulsarAuthConfig;
+
+        let config = super::PulsarSinkConfig {
+            auth: Some(PulsarAuthConfig {
+                name: None,
+                token: None,
+                oauth2: None,
+            }),
+            ..super::PulsarSinkConfig::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("auth") && e.contains("empty")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_name_without_token() {
+        use crate::config::SinkConfig;
+        use crate::sinks::pulsar::config::PulsarAuthConfig;
+
+        let config = super::PulsarSinkConfig {
+            auth: Some(PulsarAuthConfig {
+                name: Some("user".to_string()),
+                token: None,
+                oauth2: None,
+            }),
+            ..super::PulsarSinkConfig::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("name") && e.contains("token")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_token_without_name() {
+        use crate::config::SinkConfig;
+        use crate::sinks::pulsar::config::PulsarAuthConfig;
+        use vector_lib::sensitive_string::SensitiveString;
+
+        let config = super::PulsarSinkConfig {
+            auth: Some(PulsarAuthConfig {
+                name: None,
+                token: Some(SensitiveString::from("secret".to_string())),
+                oauth2: None,
+            }),
+            ..super::PulsarSinkConfig::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("token") && e.contains("name")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_mixed_name_token_with_oauth2() {
+        use crate::config::SinkConfig;
+        use crate::sinks::pulsar::config::{OAuth2Config, PulsarAuthConfig};
+        use vector_lib::sensitive_string::SensitiveString;
+
+        let config = super::PulsarSinkConfig {
+            auth: Some(PulsarAuthConfig {
+                name: Some("user".to_string()),
+                token: Some(SensitiveString::from("secret".to_string())),
+                oauth2: Some(OAuth2Config {
+                    issuer_url: "https://issuer".to_string(),
+                    credentials_url: "file:///creds".to_string(),
+                    audience: None,
+                    scope: None,
+                }),
+            }),
+            ..super::PulsarSinkConfig::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("oauth2") || e.contains("both")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_accepts_name_and_token() {
+        use crate::config::SinkConfig;
+        use crate::sinks::pulsar::config::PulsarAuthConfig;
+        use vector_lib::sensitive_string::SensitiveString;
+
+        let config = super::PulsarSinkConfig {
+            auth: Some(PulsarAuthConfig {
+                name: Some("user".to_string()),
+                token: Some(SensitiveString::from("secret".to_string())),
+                oauth2: None,
+            }),
+            ..super::PulsarSinkConfig::default()
+        };
+
+        config.validate_structure().unwrap();
+    }
+
+    #[test]
+    fn validate_structure_accepts_oauth2_only() {
+        use crate::config::SinkConfig;
+        use crate::sinks::pulsar::config::{OAuth2Config, PulsarAuthConfig};
+
+        let config = super::PulsarSinkConfig {
+            auth: Some(PulsarAuthConfig {
+                name: None,
+                token: None,
+                oauth2: Some(OAuth2Config {
+                    issuer_url: "https://issuer".to_string(),
+                    credentials_url: "file:///creds".to_string(),
+                    audience: None,
+                    scope: None,
+                }),
+            }),
+            ..super::PulsarSinkConfig::default()
+        };
+
+        config.validate_structure().unwrap();
     }
 }

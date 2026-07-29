@@ -241,6 +241,18 @@ impl SinkConfig for RedisSinkConfig {
             errors.push(e.to_string());
         }
 
+        // Validate endpoints (mirrors build_connection check)
+        let endpoints = self.endpoint.clone().to_vec();
+        if endpoints.is_empty() {
+            errors.push("`endpoint` cannot be empty.".to_string());
+        } else if self.sentinel_service.is_none() {
+            // For non-sentinel, validate the first endpoint can be parsed
+            // redis::Client::open will parse the URL
+            if let Err(e) = redis::Client::open(endpoints[0].as_str()) {
+                errors.push(format!("`endpoint` is invalid: {e}"));
+            }
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -393,6 +405,7 @@ impl From<RedisProtocolVersion> for ProtocolVersion {
 
 #[cfg(test)]
 mod tests {
+    use crate::codecs::TextSerializerConfig;
     use crate::template::{ConfinementConfig, Template};
 
     #[test]
@@ -426,6 +439,7 @@ mod tests {
         use super::*;
         use crate::codecs::TextSerializerConfig;
         use crate::config::SinkConfig;
+        use crate::sinks::util::TowerRequestConfig;
         use crate::sinks::util::batch::BatchConfig;
 
         let config = RedisSinkConfig {
@@ -449,6 +463,66 @@ mod tests {
             errors[0].contains("key") && errors[0].contains("empty"),
             "unexpected error: {:?}",
             errors[0]
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_empty_endpoints() {
+        use super::*;
+        use crate::config::SinkConfig;
+        use crate::sinks::util::TowerRequestConfig;
+
+        let config = RedisSinkConfig {
+            key: Template::try_from("test").unwrap(),
+            endpoint: vec![].into(),
+            encoding: EncodingConfig::from(TextSerializerConfig::default()),
+            data_type: DataTypeConfig::default(),
+            list_option: None,
+            sorted_set_option: None,
+            sentinel_service: None,
+            sentinel_connect: None,
+            batch: BatchConfig::default(),
+            request: TowerRequestConfig::default(),
+            acknowledgements: AcknowledgementsConfig::default(),
+            confinement: ConfinementConfig::default(),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("endpoint") && e.contains("empty")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_invalid_endpoint() {
+        use super::*;
+        use crate::config::SinkConfig;
+        use crate::sinks::util::TowerRequestConfig;
+
+        let config = RedisSinkConfig {
+            key: Template::try_from("test").unwrap(),
+            endpoint: vec!["not-a-valid-redis-url".to_string()].into(),
+            encoding: EncodingConfig::from(TextSerializerConfig::default()),
+            data_type: DataTypeConfig::default(),
+            list_option: None,
+            sorted_set_option: None,
+            sentinel_service: None,
+            sentinel_connect: None,
+            batch: BatchConfig::default(),
+            request: TowerRequestConfig::default(),
+            acknowledgements: AcknowledgementsConfig::default(),
+            confinement: ConfinementConfig::default(),
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("endpoint")),
+            "unexpected errors: {:?}",
+            errors
         );
     }
 }

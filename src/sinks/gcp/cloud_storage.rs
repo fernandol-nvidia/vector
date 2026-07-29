@@ -243,7 +243,7 @@ fn default_config(encoding: EncodingConfigWithFraming) -> GcsSinkConfig {
         encoding,
         compression: Compression::gzip_default(),
         batch: Default::default(),
-        endpoint: Default::default(),
+        endpoint: default_endpoint(),
         request: Default::default(),
         auth: Default::default(),
         tls: Default::default(),

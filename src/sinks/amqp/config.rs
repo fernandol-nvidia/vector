@@ -164,6 +164,11 @@ impl SinkConfig for AmqpSinkConfig {
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
+        // Validate max_channels is positive (mirrors new_channel_pool check)
+        if self.max_channels == 0 {
+            errors.push("max_channels must be positive".to_string());
+        }
+
         if let Err(e) = self
             .exchange
             .clone()
@@ -351,5 +356,23 @@ mod tests {
             };
             assert_config_priority_eq(config, &event, 2);
         }
+    }
+
+    #[test]
+    fn validate_structure_rejects_zero_max_channels() {
+        use crate::config::SinkConfig;
+
+        let config = AmqpSinkConfig {
+            max_channels: 0,
+            ..AmqpSinkConfig::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("max_channels"),
+            "unexpected error: {:?}",
+            errors[0]
+        );
     }
 }

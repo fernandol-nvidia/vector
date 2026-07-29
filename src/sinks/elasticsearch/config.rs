@@ -794,6 +794,20 @@ impl SinkConfig for ElasticsearchConfig {
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
+        // Validate endpoint shape: exactly one of endpoint or endpoints must be set
+        match (&self.endpoint, &self.endpoints) {
+            (Some(_), _) if !self.endpoints.is_empty() => {
+                errors.push(
+                    "`endpoint` and `endpoints` options are mutually exclusive. Please use `endpoints` option."
+                        .to_string(),
+                );
+            }
+            (None, endpoints) if endpoints.is_empty() => {
+                errors.push("Endpoints option must be specified.".to_string());
+            }
+            _ => {}
+        }
+
         // Validate the active mode's routing templates.
         // This mirrors the confinement logic in common_mode().
         match self.mode {
@@ -1084,5 +1098,43 @@ mod tests {
         );
         assert!(matches!(config.auth, Some(ElasticsearchAuthConfig::Aws(_))));
         assert_eq!(config.api_version, ElasticsearchApiVersion::Auto);
+    }
+
+    #[test]
+    fn validate_structure_rejects_no_endpoints() {
+        use crate::config::SinkConfig;
+
+        let config = ElasticsearchConfig {
+            endpoint: None,
+            endpoints: vec![],
+            ..ElasticsearchConfig::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("Endpoints option must be specified")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_both_endpoint_and_endpoints() {
+        use crate::config::SinkConfig;
+
+        let config = ElasticsearchConfig {
+            endpoint: Some("http://localhost:9200".to_string()),
+            endpoints: vec!["http://localhost:9201".to_string()],
+            ..ElasticsearchConfig::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("mutually exclusive")),
+            "unexpected errors: {:?}",
+            errors
+        );
     }
 }

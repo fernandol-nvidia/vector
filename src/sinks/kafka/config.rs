@@ -354,6 +354,11 @@ impl SinkConfig for KafkaSinkConfig {
             }
         }
 
+        // Validate encoding configuration (mirrors KafkaSink::new check)
+        if let Err(e) = self.encoding.build() {
+            errors.push(format!("encoding: {e}"));
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {

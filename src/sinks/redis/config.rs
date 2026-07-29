@@ -258,6 +258,11 @@ impl SinkConfig for RedisSinkConfig {
             errors.push(format!("batch: {e}"));
         }
 
+        // Validate encoding configuration (mirrors RedisSink::new check)
+        if let Err(e) = self.encoding.build() {
+            errors.push(format!("encoding: {e}"));
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {

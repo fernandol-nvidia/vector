@@ -346,10 +346,27 @@ impl SinkConfig for GcsSinkConfig {
         // Validate endpoint URL parses correctly
         // build_sink() calls base_url.parse::<Uri>().unwrap() after formatting
         let base_url = format!("{}/{}/", self.endpoint, self.bucket);
-        if let Err(e) = base_url.parse::<Uri>() {
-            errors.push(format!(
-                "endpoint: invalid URL after combining with bucket: {e}"
-            ));
+        match base_url.parse::<Uri>() {
+            Ok(uri) => {
+                // Validate scheme is http or https (get_http_scheme_from_uri panics otherwise)
+                let scheme = uri.scheme().map(|s| s.as_str()).unwrap_or("");
+                if scheme != "http" && scheme != "https" {
+                    errors.push(format!(
+                        "endpoint: scheme must be 'http' or 'https', got '{}'",
+                        scheme
+                    ));
+                }
+            }
+            Err(e) => {
+                errors.push(format!(
+                    "endpoint: invalid URL after combining with bucket: {e}"
+                ));
+            }
+        }
+
+        // Validate encoding configuration (mirrors RequestSettings::new check)
+        if let Err(e) = self.encoding.build(SinkType::MessageBased) {
+            errors.push(format!("encoding: {e}"));
         }
 
         // Validate batch settings
@@ -1018,6 +1035,24 @@ mod tests {
             errors
                 .iter()
                 .any(|e| e.contains("endpoint") && e.contains("invalid URL")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_non_http_scheme() {
+        let config = GcsSinkConfig {
+            endpoint: "ftp://storage.example.com".to_string(),
+            bucket: "my-bucket".to_string(),
+            ..default_config((None::<FramingConfig>, TextSerializerConfig::default()).into())
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("endpoint") && e.contains("scheme") && e.contains("http")),
             "unexpected errors: {:?}",
             errors
         );

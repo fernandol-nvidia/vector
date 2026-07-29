@@ -198,8 +198,19 @@ impl SinkConfig for RemoteWriteConfig {
         let mut errors = Vec::new();
 
         // Validate endpoint can be parsed as URI
-        if let Err(e) = self.endpoint.parse::<Uri>() {
-            errors.push(format!("endpoint: invalid URI: {e}"));
+        match self.endpoint.parse::<Uri>() {
+            Ok(uri) => {
+                // Validate endpoint has scheme and host (absolute URI)
+                if uri.scheme().is_none() {
+                    errors.push("endpoint: must include a scheme (http:// or https://)".to_string());
+                }
+                if uri.host().is_none() {
+                    errors.push("endpoint: must include a host".to_string());
+                }
+            }
+            Err(e) => {
+                errors.push(format!("endpoint: invalid URI: {e}"));
+            }
         }
 
         // Validate headers (format and auth conflict)
@@ -216,6 +227,13 @@ impl SinkConfig for RemoteWriteConfig {
         // Validate batch settings (mirrors build() call to validate/into_batcher_settings)
         if let Err(e) = self.batch.batch_settings.validate() {
             errors.push(format!("batch: {e}"));
+        }
+
+        #[cfg(feature = "aws-core")]
+        if let Some(PrometheusRemoteWriteAuth::Aws(_)) = &self.auth
+            && self.aws.is_none()
+        {
+            errors.push("aws configuration is required when using AWS authentication".to_string());
         }
 
         if errors.is_empty() {

@@ -271,6 +271,15 @@ impl SinkConfig for LokiConfig {
             );
         }
 
+        // Validate endpoint scheme is http or https (get_http_scheme_from_uri panics otherwise)
+        let scheme = self.endpoint.uri.scheme().map(|s| s.as_str()).unwrap_or("");
+        if scheme != "http" && scheme != "https" {
+            errors.push(format!(
+                "endpoint: scheme must be 'http' or 'https', got '{}'",
+                scheme
+            ));
+        }
+
         // Check for empty labels (mirrors build() check)
         if self.labels.is_empty() {
             errors.push("`labels` must include at least one label.".to_string());
@@ -313,6 +322,11 @@ impl SinkConfig for LokiConfig {
         // Validate batch settings (mirrors self.batch.into_batcher_settings()? in LokiSink::new())
         if let Err(e) = self.batch.validate() {
             errors.push(format!("batch: {e}"));
+        }
+
+        // Validate encoding configuration (mirrors LokiSink::new check)
+        if let Err(e) = self.encoding.build() {
+            errors.push(format!("encoding: {e}"));
         }
 
         if errors.is_empty() {

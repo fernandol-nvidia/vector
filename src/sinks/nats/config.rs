@@ -237,6 +237,11 @@ impl SinkConfig for NatsSinkConfig {
             }
         }
 
+        // Validate encoding configuration (mirrors NatsSink::new check)
+        if let Err(e) = self.encoding.build() {
+            errors.push(format!("encoding: {e}"));
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {

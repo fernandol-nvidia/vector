@@ -859,6 +859,28 @@ impl SinkConfig for ElasticsearchConfig {
             );
         }
 
+        // Validate OpenSearch Serverless preconditions
+        // (mirrors checks in ElasticsearchCommon::parse_config)
+        if self.opensearch_service_type == OpenSearchServiceType::Serverless {
+            #[cfg(feature = "aws-core")]
+            match &self.auth {
+                Some(ElasticsearchAuthConfig::Aws(_)) => (),
+                _ => errors.push(
+                    "opensearch_service_type 'serverless' requires 'auth' to be set to 'aws'".to_string()
+                ),
+            }
+            #[cfg(not(feature = "aws-core"))]
+            errors.push(
+                "opensearch_service_type 'serverless' requires 'aws' auth but aws-core feature is disabled".to_string()
+            );
+
+            if self.api_version != ElasticsearchApiVersion::Auto {
+                errors.push(
+                    "opensearch_service_type 'serverless' requires api_version to be 'auto'".to_string()
+                );
+            }
+        }
+
         // Validate the active mode's routing templates.
         // This mirrors the confinement logic in common_mode().
         match self.mode {
@@ -1290,6 +1312,44 @@ mod tests {
         let errors = config.validate_structure().unwrap_err();
         assert!(
             errors.iter().any(|e| e.contains("ignored")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_serverless_without_aws_auth() {
+        use crate::config::SinkConfig;
+
+        let config = ElasticsearchConfig {
+            endpoints: vec!["http://localhost:9200".to_string()],
+            opensearch_service_type: OpenSearchServiceType::Serverless,
+            auth: None,
+            ..ElasticsearchConfig::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("serverless") && e.contains("aws")),
+            "unexpected errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_serverless_with_non_auto_api_version() {
+        use crate::config::SinkConfig;
+
+        let config = ElasticsearchConfig {
+            endpoints: vec!["http://localhost:9200".to_string()],
+            opensearch_service_type: OpenSearchServiceType::Serverless,
+            api_version: ElasticsearchApiVersion::V7,
+            ..ElasticsearchConfig::default()
+        };
+
+        let errors = config.validate_structure().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("serverless") && e.contains("api_version")),
             "unexpected errors: {:?}",
             errors
         );

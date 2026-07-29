@@ -3,7 +3,7 @@
 use super::sink::DorisSink;
 
 use crate::{
-    codecs::EncodingConfigWithFraming,
+    codecs::{EncodingConfigWithFraming, SinkType},
     http::{Auth, HttpClient, MaybeAuth},
     sinks::{
         doris::{
@@ -278,6 +278,11 @@ impl SinkConfig for DorisConfig {
 
         if let Err(e) = self.batch.validate() {
             errors.push(format!("batch: {e}"));
+        }
+
+        // Validate encoding configuration (mirrors DorisCommon::parse_config)
+        if let Err(e) = self.encoding.build(SinkType::StreamBased) {
+            errors.push(format!("encoding: {e}"));
         }
 
         if let Err(e) = self

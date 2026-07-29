@@ -291,6 +291,13 @@ impl SinkConfig for HttpSinkConfig {
             // Parse as UriSerde to extract any embedded auth
             match self.uri.get_ref().parse::<UriSerde>() {
                 Ok(uri_serde) => {
+                    // Check that static URI has scheme and host
+                    if uri_serde.uri.scheme().is_none() {
+                        errors.push("uri: must include a scheme (http:// or https://)".to_string());
+                    }
+                    if uri_serde.uri.host().is_none() {
+                        errors.push("uri: must include a host".to_string());
+                    }
                     // Check for duplicate credentials (auth in URI + auth in config)
                     if let Err(e) = self.auth.choose_one(&uri_serde.auth) {
                         errors.push(format!("auth: {e}"));
@@ -299,6 +306,20 @@ impl SinkConfig for HttpSinkConfig {
                 Err(e) => {
                     errors.push(format!("uri: invalid URI: {e}"));
                 }
+            }
+        } else {
+            // For dynamic URIs, check if the static prefix contains embedded auth
+            // This would conflict with top-level auth on every render
+            let uri_str = self.uri.get_ref();
+            if uri_str.contains("://")
+                && let Some(at_pos) = uri_str.find('@')
+                && let Some(scheme_end) = uri_str.find("://")
+                && at_pos > scheme_end
+                && self.auth.is_some()
+            {
+                errors.push(
+                    "uri: contains embedded credentials that conflict with `auth`. Remove credentials from the URI or remove `auth`.".to_string()
+                );
             }
         }
 

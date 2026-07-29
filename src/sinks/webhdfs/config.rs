@@ -148,6 +148,11 @@ impl SinkConfig for WebHdfsConfig {
             errors.push(format!("batch: {e}"));
         }
 
+        // Validate encoding configuration (mirrors build_processor's encoding.build)
+        if let Err(e) = self.encoding.build(SinkType::MessageBased) {
+            errors.push(format!("encoding: {e}"));
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {

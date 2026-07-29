@@ -362,6 +362,26 @@ impl SinkConfig for AzureBlobSinkConfig {
             errors.push(e.to_string());
         }
 
+        // Validate blob_endpoint URL can be parsed (mirrors build_client's URL synthesis)
+        if let Some(blob_endpoint) = &self.blob_endpoint {
+            // BlobEndpoint must end in a trailing slash, add if missing
+            let endpoint_url = if blob_endpoint.ends_with('/') {
+                blob_endpoint.clone()
+            } else {
+                format!("{}/", blob_endpoint)
+            };
+            // Synthesize the container URL the same way build_client does
+            let container_url = format!("{}{}", endpoint_url, self.container_name);
+            if let Err(e) = Url::parse(&container_url) {
+                errors.push(format!("blob_endpoint: invalid URL: {e}"));
+            }
+        }
+
+        // Validate encoding configuration (mirrors build_processor's encoding.build)
+        if let Err(e) = self.encoding.build(SinkType::MessageBased) {
+            errors.push(format!("encoding: {e}"));
+        }
+
         // Validate batch settings (mirrors build_processor's into_batcher_settings)
         if let Err(e) = self.batch.into_batcher_settings() {
             errors.push(format!("batch: {e}"));

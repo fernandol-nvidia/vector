@@ -267,6 +267,11 @@ impl SinkConfig for CloudwatchLogsSinkConfig {
             errors.push(format!("batch: {e}"));
         }
 
+        // Validate encoding configuration (mirrors build() check)
+        if let Err(e) = self.encoding.build() {
+            errors.push(format!("encoding: {e}"));
+        }
+
         if let Err(e) = self
             .group_name
             .clone()

@@ -325,9 +325,8 @@ impl SinkConfig for ClickhouseConfig {
             }
         }
 
-        // Validate endpoint has a host
-        let endpoint = self.endpoint.with_default_parts();
-        if endpoint.uri.host().is_none() {
+        // Validate endpoint has a host (check before with_default_parts fills in defaults)
+        if self.endpoint.uri.host().is_none() {
             errors.push("endpoint must include a host".to_string());
         }
 
@@ -784,7 +783,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| e.contains("auth") && e.contains("choose")),
+                .any(|e| e.contains("auth") && e.contains("credentials")),
             "expected duplicate auth error, got: {:?}",
             errors
         );

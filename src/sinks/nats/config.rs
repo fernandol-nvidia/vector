@@ -181,41 +181,27 @@ impl GenerateConfig for NatsSinkConfig {
     }
 }
 
-#[async_trait::async_trait]
-#[typetag::serde(name = "nats")]
-impl SinkConfig for NatsSinkConfig {
-    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+/// Values derived while validating [`NatsSinkConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain the confined template the sink renders with
+/// is [`ValidateSink::validate`].
+#[derive(Debug)]
+pub struct ValidatedNatsSink {
+    subject: ConfinedTemplate,
+}
+
+impl ValidateSink for NatsSinkConfig {
+    type Validated = ValidatedNatsSink;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        let mut errors = Vec::new();
+
         let subject = self
             .subject
             .clone()
-            .confine(&self.confinement, Self::NAME, "subject")?;
-        let sink = NatsSink::new(self.clone(), subject).await?;
-        let healthcheck = healthcheck(self.clone()).boxed();
-        Ok((VectorSink::from_event_streamsink(sink), healthcheck))
-    }
-
-    fn confinement_config(&self) -> Option<&crate::template::ConfinementConfig> {
-        Some(&self.confinement)
-    }
-
-    fn input(&self) -> Input {
-        Input::new(self.encoding.config().input_type() & DataType::Log)
-    }
-
-    fn acknowledgements(&self) -> &AcknowledgementsConfig {
-        &self.acknowledgements
-    }
-
-    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        if let Err(e) = self
-            .subject
-            .clone()
             .confine(&self.confinement, Self::NAME, "subject")
-        {
-            errors.push(e.to_string());
-        }
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
 
         // Parse server addresses to catch malformed URLs early
         if let Err(e) = self.parse_server_addresses() {
@@ -242,11 +228,37 @@ impl SinkConfig for NatsSinkConfig {
             errors.push(format!("encoding: {e}"));
         }
 
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
+        match (errors.is_empty(), subject) {
+            (true, Some(subject)) => Ok(ValidatedNatsSink { subject }),
+            _ => Err(errors),
         }
+    }
+}
+
+#[async_trait::async_trait]
+#[typetag::serde(name = "nats")]
+impl SinkConfig for NatsSinkConfig {
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        self.validate().map(|_| ())
+    }
+
+    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        let ValidatedNatsSink { subject } = self.validate().map_err(|errors| errors.join("; "))?;
+        let sink = NatsSink::new(self.clone(), subject).await?;
+        let healthcheck = healthcheck(self.clone()).boxed();
+        Ok((VectorSink::from_event_streamsink(sink), healthcheck))
+    }
+
+    fn confinement_config(&self) -> Option<&crate::template::ConfinementConfig> {
+        Some(&self.confinement)
+    }
+
+    fn input(&self) -> Input {
+        Input::new(self.encoding.config().input_type() & DataType::Log)
+    }
+
+    fn acknowledgements(&self) -> &AcknowledgementsConfig {
+        &self.acknowledgements
     }
 }
 
@@ -360,8 +372,13 @@ impl NatsPublisher {
 
 #[cfg(test)]
 mod tests {
-    use crate::template::{ConfinementConfig, Template};
+    use crate::{
+        config::ValidateSink,
+        event::{Event, LogEvent},
+        template::{ConfinementConfig, Template},
+    };
     use vector_lib::codecs::JsonSerializerConfig;
+    use vrl::event_path;
 
     #[test]
     fn confinement_rejects_unconfined_subject() {
@@ -433,6 +450,33 @@ mod tests {
         };
 
         config.validate_structure().unwrap();
+    }
+
+    #[test]
+    fn validate_yields_confined_subject() {
+        let config = super::NatsSinkConfig {
+            acknowledgements: Default::default(),
+            auth: None,
+            connection_name: "vector".into(),
+            encoding: JsonSerializerConfig::default().into(),
+            subject: Template::try_from("events-{{ env }}").unwrap(),
+            tls: None,
+            url: "nats://localhost:4222".into(),
+            request: Default::default(),
+            jetstream: Default::default(),
+            confinement: ConfinementConfig::default(),
+        };
+
+        let validated = config.validate().expect("config is valid");
+
+        let mut event = LogEvent::from_str_legacy("message");
+        event.insert(event_path!("env"), "prod");
+        let event = Event::from(event);
+
+        assert_eq!(
+            validated.subject.render_string(&event).unwrap(),
+            "events-prod"
+        );
     }
 
     #[test]

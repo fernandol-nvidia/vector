@@ -15,7 +15,7 @@ use vrl::event_path;
 use super::{config::DATA_STREAM_TIMESTAMP_KEY, *};
 use crate::{
     aws::{ImdsAuthentication, RegionOrEndpoint},
-    config::{ProxyConfig, SinkConfig, SinkContext},
+    config::{ProxyConfig, SinkConfig, SinkContext, ValidateSink},
     http::{HttpClient, ParameterValue, QueryParameterValue},
     sinks::{
         HealthcheckError,
@@ -732,7 +732,8 @@ async fn run_insert_tests_with_config(
 
 async fn run_insert_tests_with_multiple_endpoints(config: &ElasticsearchConfig) {
     let cx = SinkContext::default();
-    let commons = ElasticsearchCommon::parse_many(config, cx.proxy())
+    let validated = config.validate().expect("Config error");
+    let commons = ElasticsearchCommon::parse_many(config, &validated, cx.proxy())
         .await
         .expect("Config error");
     let index = match config.mode {

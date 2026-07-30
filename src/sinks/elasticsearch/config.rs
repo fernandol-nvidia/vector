@@ -8,12 +8,13 @@ use vector_lib::{
     configurable::configurable_component,
     lookup::{event_path, lookup_v2::ConfigValuePath},
     schema::Requirement,
+    stream::BatcherSettings,
 };
 use vrl::value::Kind;
 
 use crate::{
     codecs::Transformer,
-    config::{AcknowledgementsConfig, DataType, Input, SinkConfig, SinkContext},
+    config::{AcknowledgementsConfig, DataType, Input, SinkConfig, SinkContext, ValidateSink},
     event::{EventRef, LogEvent, Value},
     http::{HttpClient, QueryParameters},
     internal_events::TemplateRenderingError,
@@ -28,8 +29,8 @@ use crate::{
             sink::ElasticsearchSink,
         },
         util::{
-            BatchConfig, Compression, RealtimeSizeBasedDefaultBatchSettings, http::RequestConfig,
-            service::HealthConfig,
+            BatchConfig, Compression, RealtimeSizeBasedDefaultBatchSettings, UriSerde,
+            http::RequestConfig, service::HealthConfig,
         },
     },
     template::{ConfinedTemplate, ConfinementConfig, Template, UnconfinedTemplate},
@@ -263,37 +264,6 @@ impl Default for ElasticsearchConfig {
             metrics: None,
             acknowledgements: Default::default(),
             confinement: ConfinementConfig::default(),
-        }
-    }
-}
-
-impl ElasticsearchConfig {
-    /// Build the render-capable [`ElasticsearchCommonMode`], confining the templated fields of the
-    /// active mode. `common_mode()` ignores the inactive branch, so a leftover unused template
-    /// (e.g. a `bulk.index` in a config that runs in `data_stream` mode) is never confined and
-    /// cannot reject an otherwise-valid config.
-    pub fn common_mode(&self) -> crate::Result<ElasticsearchCommonMode> {
-        match self.mode {
-            ElasticsearchMode::Bulk => Ok(ElasticsearchCommonMode::Bulk {
-                // Only `index` is a routing field, so it is the only bulk template that is confined.
-                // `action` and `version` are not routing values and render unconfined, hence their
-                // `UnconfinedTemplate` type.
-                index: self.bulk.index.clone().confine(
-                    &self.confinement,
-                    Self::NAME,
-                    "bulk.index",
-                )?,
-                template_fallback_index: self.bulk.template_fallback_index.clone(),
-                action: self.bulk.action.clone(),
-                version: self.bulk.version.clone(),
-                version_type: self.bulk.version_type,
-            }),
-            ElasticsearchMode::DataStream => Ok(ElasticsearchCommonMode::DataStream(
-                self.data_stream
-                    .clone()
-                    .unwrap_or_default()
-                    .confine(&self.confinement, Self::NAME)?,
-            )),
         }
     }
 }
@@ -725,14 +695,182 @@ fn is_valid_data_stream_component(s: &str, field: &str) -> bool {
     true
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct ValidatedElasticsearchEndpoint {
+    uri: UriSerde,
+}
+
+impl ValidatedElasticsearchEndpoint {
+    pub(super) const fn uri(&self) -> &UriSerde {
+        &self.uri
+    }
+}
+
+/// Values derived while validating [`ElasticsearchConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain parsed endpoints, confined routing templates,
+/// and batcher settings is [`ValidateSink::validate`].
+#[derive(Debug)]
+pub struct ValidatedElasticsearch {
+    endpoints: Vec<ValidatedElasticsearchEndpoint>,
+    mode: ElasticsearchCommonMode,
+    batch_settings: BatcherSettings,
+}
+
+impl ValidateSink for ElasticsearchConfig {
+    type Validated = ValidatedElasticsearch;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        let mut errors = Vec::new();
+
+        match (&self.endpoint, &self.endpoints) {
+            (Some(_), _) if !self.endpoints.is_empty() => {
+                errors.push(
+                    "`endpoint` and `endpoints` options are mutually exclusive. Please use `endpoints` option."
+                        .to_string(),
+                );
+            }
+            (None, endpoints) if endpoints.is_empty() => {
+                errors.push("Endpoints option must be specified.".to_string());
+            }
+            _ => {}
+        }
+
+        let mut endpoints = Vec::new();
+        for endpoint in self.endpoints.iter().chain(self.endpoint.iter()) {
+            let uri = endpoint
+                .parse::<UriSerde>()
+                .inspect_err(|e| errors.push(format!("endpoint '{endpoint}': invalid URI: {e}")))
+                .ok();
+
+            if let Some(uri) = uri {
+                if uri.uri.host().is_none() {
+                    errors.push(format!("endpoint '{endpoint}': must include hostname"));
+                }
+                if uri.auth.is_some() && self.auth.is_some() {
+                    errors.push(
+                        "endpoint contains credentials and `auth` is also configured".to_string(),
+                    );
+                }
+                endpoints.push(ValidatedElasticsearchEndpoint { uri });
+            }
+        }
+
+        let batch_settings = self
+            .batch
+            .into_batcher_settings()
+            .inspect_err(|e| errors.push(format!("batch: {e}")))
+            .ok();
+
+        if self.bulk.version.is_some() && self.bulk.version_type == VersionType::Internal {
+            errors.push(
+                "bulk.version will be ignored because bulk.version_type is 'internal'".to_string(),
+            );
+        }
+        if self.bulk.version.is_some()
+            && (self.bulk.version_type == VersionType::External
+                || self.bulk.version_type == VersionType::ExternalGte)
+            && self.id_key.is_none()
+        {
+            errors.push(
+                "bulk.version_type 'external' or 'external_gte' requires id_key to be set"
+                    .to_string(),
+            );
+        }
+        if self.bulk.version.is_none()
+            && (self.bulk.version_type == VersionType::External
+                || self.bulk.version_type == VersionType::ExternalGte)
+        {
+            errors.push(
+                "bulk.version_type 'external' or 'external_gte' requires bulk.version to be set"
+                    .to_string(),
+            );
+        }
+
+        if self.opensearch_service_type == OpenSearchServiceType::Serverless {
+            #[cfg(feature = "aws-core")]
+            match &self.auth {
+                Some(ElasticsearchAuthConfig::Aws(_)) => (),
+                _ => errors.push(
+                    "opensearch_service_type 'serverless' requires 'auth' to be set to 'aws'"
+                        .to_string(),
+                ),
+            }
+            #[cfg(not(feature = "aws-core"))]
+            errors.push(
+                "opensearch_service_type 'serverless' requires 'aws' auth but aws-core feature is disabled".to_string()
+            );
+
+            if self.api_version != ElasticsearchApiVersion::Auto {
+                errors.push(
+                    "opensearch_service_type 'serverless' requires api_version to be 'auto'"
+                        .to_string(),
+                );
+            }
+        }
+
+        let mode = match self.mode {
+            ElasticsearchMode::Bulk => self
+                .bulk
+                .index
+                .clone()
+                .confine(&self.confinement, Self::NAME, "bulk.index")
+                .map(|index| ElasticsearchCommonMode::Bulk {
+                    index,
+                    template_fallback_index: self.bulk.template_fallback_index.clone(),
+                    action: self.bulk.action.clone(),
+                    version: self.bulk.version.clone(),
+                    version_type: self.bulk.version_type,
+                })
+                .inspect_err(|e| errors.push(e.to_string()))
+                .ok(),
+            ElasticsearchMode::DataStream => self
+                .data_stream
+                .clone()
+                .unwrap_or_default()
+                .confine(&self.confinement, Self::NAME)
+                .map(ElasticsearchCommonMode::DataStream)
+                .inspect_err(|e| errors.push(e.to_string()))
+                .ok(),
+        };
+
+        match (
+            errors.is_empty(),
+            !endpoints.is_empty(),
+            batch_settings,
+            mode,
+        ) {
+            (true, true, Some(batch_settings), Some(mode)) => Ok(ValidatedElasticsearch {
+                endpoints,
+                mode,
+                batch_settings,
+            }),
+            _ => Err(errors),
+        }
+    }
+}
+
+impl ValidatedElasticsearch {
+    pub(super) fn endpoints(&self) -> &[ValidatedElasticsearchEndpoint] {
+        &self.endpoints
+    }
+
+    pub(super) const fn mode(&self) -> &ElasticsearchCommonMode {
+        &self.mode
+    }
+}
+
 #[async_trait::async_trait]
 #[typetag::serde(name = "elasticsearch")]
 impl SinkConfig for ElasticsearchConfig {
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        self.validate().map(|_| ())
+    }
+
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        // Confinement of the active mode's routing templates happens in
-        // [`ElasticsearchConfig::common_mode`], which each `ElasticsearchCommon` calls while
-        // parsing. There is therefore nothing to confine up front here.
-        let commons = ElasticsearchCommon::parse_many(self, cx.proxy()).await?;
+        let validated = self.validate().map_err(|errors| errors.join("; "))?;
+
+        let commons = ElasticsearchCommon::parse_many(self, &validated, cx.proxy()).await?;
         let common = commons[0].clone();
 
         let client = HttpClient::new(common.tls_settings.clone(), cx.proxy())?;
@@ -763,7 +901,7 @@ impl SinkConfig for ElasticsearchConfig {
             1,
         );
 
-        let sink = ElasticsearchSink::new(&common, self, service)?;
+        let sink = ElasticsearchSink::new(&common, self, service, validated.batch_settings);
 
         let stream = VectorSink::from_event_streamsink(sink);
 
@@ -790,138 +928,15 @@ impl SinkConfig for ElasticsearchConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
-
-    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        // Validate endpoint shape: exactly one of endpoint or endpoints must be set
-        match (&self.endpoint, &self.endpoints) {
-            (Some(_), _) if !self.endpoints.is_empty() => {
-                errors.push(
-                    "`endpoint` and `endpoints` options are mutually exclusive. Please use `endpoints` option."
-                        .to_string(),
-                );
-            }
-            (None, endpoints) if endpoints.is_empty() => {
-                errors.push("Endpoints option must be specified.".to_string());
-            }
-            _ => {}
-        }
-
-        // Parse endpoints and check for host + auth conflicts
-        for endpoint in self.endpoints.iter().chain(self.endpoint.iter()) {
-            // Check that endpoint parses as UriSerde (which extracts auth)
-            match endpoint.parse::<crate::sinks::util::UriSerde>() {
-                Err(e) => errors.push(format!("endpoint '{endpoint}': invalid URI: {e}")),
-                Ok(uri) => {
-                    if uri.uri.host().is_none() {
-                        errors.push(format!("endpoint '{endpoint}': must include hostname"));
-                    }
-                    // Check for auth in URI conflicting with config auth
-                    if uri.auth.is_some() && self.auth.is_some() {
-                        errors.push(
-                            "endpoint contains credentials and `auth` is also configured"
-                                .to_string(),
-                        );
-                    }
-                }
-            }
-        }
-
-        // Validate batch settings
-        if let Err(e) = self.batch.validate() {
-            errors.push(format!("batch: {e}"));
-        }
-
-        // Validate bulk versioning constraints
-        if self.bulk.version.is_some() && self.bulk.version_type == VersionType::Internal {
-            errors.push(
-                "bulk.version will be ignored because bulk.version_type is 'internal'".to_string(),
-            );
-        }
-        if self.bulk.version.is_some()
-            && (self.bulk.version_type == VersionType::External
-                || self.bulk.version_type == VersionType::ExternalGte)
-            && self.id_key.is_none()
-        {
-            errors.push(
-                "bulk.version_type 'external' or 'external_gte' requires id_key to be set"
-                    .to_string(),
-            );
-        }
-        if self.bulk.version.is_none()
-            && (self.bulk.version_type == VersionType::External
-                || self.bulk.version_type == VersionType::ExternalGte)
-        {
-            errors.push(
-                "bulk.version_type 'external' or 'external_gte' requires bulk.version to be set"
-                    .to_string(),
-            );
-        }
-
-        // Validate OpenSearch Serverless preconditions
-        // (mirrors checks in ElasticsearchCommon::parse_config)
-        if self.opensearch_service_type == OpenSearchServiceType::Serverless {
-            #[cfg(feature = "aws-core")]
-            match &self.auth {
-                Some(ElasticsearchAuthConfig::Aws(_)) => (),
-                _ => errors.push(
-                    "opensearch_service_type 'serverless' requires 'auth' to be set to 'aws'"
-                        .to_string(),
-                ),
-            }
-            #[cfg(not(feature = "aws-core"))]
-            errors.push(
-                "opensearch_service_type 'serverless' requires 'aws' auth but aws-core feature is disabled".to_string()
-            );
-
-            if self.api_version != ElasticsearchApiVersion::Auto {
-                errors.push(
-                    "opensearch_service_type 'serverless' requires api_version to be 'auto'"
-                        .to_string(),
-                );
-            }
-        }
-
-        // Validate the active mode's routing templates.
-        // This mirrors the confinement logic in common_mode().
-        match self.mode {
-            ElasticsearchMode::Bulk => {
-                if let Err(e) =
-                    self.bulk
-                        .index
-                        .clone()
-                        .confine(&self.confinement, Self::NAME, "bulk.index")
-                {
-                    errors.push(e.to_string());
-                }
-            }
-            ElasticsearchMode::DataStream => {
-                if let Some(data_stream) = &self.data_stream {
-                    if let Err(e) = data_stream.clone().confine(&self.confinement, Self::NAME) {
-                        errors.push(e.to_string());
-                    }
-                } else {
-                    let default = DataStreamConfig::default();
-                    if let Err(e) = default.confine(&self.confinement, Self::NAME) {
-                        errors.push(e.to_string());
-                    }
-                }
-            }
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::template::{ConfinementConfig, Template};
+    use crate::{
+        config::ValidateSink,
+        template::{ConfinementConfig, Template},
+    };
 
     #[test]
     fn generate_config() {
@@ -1173,6 +1188,54 @@ mod tests {
         );
         assert!(matches!(config.auth, Some(ElasticsearchAuthConfig::Aws(_))));
         assert_eq!(config.api_version, ElasticsearchApiVersion::Auto);
+    }
+
+    #[test]
+    fn validate_yields_confined_mode_and_batch_settings() {
+        let bulk_config = ElasticsearchConfig {
+            endpoints: vec!["http://localhost:9200".to_string()],
+            bulk: BulkConfig {
+                index: Template::try_from("events-{{ env }}").unwrap(),
+                ..BulkConfig::default()
+            },
+            ..ElasticsearchConfig::default()
+        };
+
+        let validated = bulk_config.validate().expect("config is valid");
+
+        let mut log = LogEvent::from("message");
+        log.insert(vector_lib::lookup::event_path!("env"), "prod");
+
+        match &validated.mode {
+            ElasticsearchCommonMode::Bulk { index, .. } => {
+                assert_eq!(index.render_string(&log).unwrap(), "events-prod");
+            }
+            ElasticsearchCommonMode::DataStream(_) => panic!("expected bulk mode"),
+        }
+        assert!(validated.batch_settings.size_limit > 0);
+        assert!(validated.batch_settings.item_limit > 0);
+
+        let data_stream_config = ElasticsearchConfig {
+            endpoints: vec!["http://localhost:9200".to_string()],
+            mode: ElasticsearchMode::DataStream,
+            data_stream: Some(DataStreamConfig {
+                dtype: Template::try_from("logs").unwrap(),
+                dataset: Template::try_from("app").unwrap(),
+                namespace: Template::try_from("ns{{ env }}").unwrap(),
+                auto_routing: false,
+                sync_fields: false,
+            }),
+            ..ElasticsearchConfig::default()
+        };
+
+        let validated = data_stream_config.validate().expect("config is valid");
+
+        match &validated.mode {
+            ElasticsearchCommonMode::DataStream(data_stream) => {
+                assert_eq!(data_stream.index(&log).unwrap(), "logs-app-nsprod");
+            }
+            ElasticsearchCommonMode::Bulk { .. } => panic!("expected data stream mode"),
+        }
     }
 
     #[test]

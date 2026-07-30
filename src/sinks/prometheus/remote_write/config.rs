@@ -1,7 +1,8 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
+#[cfg(feature = "aws-core")]
+use aws_types::region::Region;
 use http::{HeaderValue, Uri, header::AUTHORIZATION};
-use snafu::prelude::*;
 
 #[cfg(feature = "aws-core")]
 use super::Errors;
@@ -12,7 +13,6 @@ use super::{
 use crate::{
     http::HttpClient,
     sinks::{
-        UriParseSnafu,
         prelude::*,
         prometheus::PrometheusRemoteWriteAuth,
         util::{
@@ -187,6 +187,121 @@ fn validate_headers(
     Ok(headers)
 }
 
+/// Values derived while validating [`RemoteWriteConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain the parsed endpoint, validated headers,
+/// confined tenant template, and batch settings the sink uses is [`ValidateSink::validate`].
+pub struct ValidatedPrometheusRemoteWrite {
+    endpoint: Uri,
+    headers: BTreeMap<OrderedHeaderName, HeaderValue>,
+    tenant_id: Option<ConfinedTemplate>,
+    batch_settings: BatcherSettings,
+    #[cfg(feature = "aws-core")]
+    aws_region: Option<Region>,
+}
+
+impl fmt::Debug for ValidatedPrometheusRemoteWrite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = f.debug_struct("ValidatedPrometheusRemoteWrite");
+        debug.field("endpoint", &self.endpoint);
+        debug.field("headers", &self.headers);
+        debug.field("tenant_id", &self.tenant_id.as_ref().map(|_| "<confined>"));
+        debug.field("batch_settings", &self.batch_settings);
+        #[cfg(feature = "aws-core")]
+        debug.field("aws_region", &self.aws_region);
+        debug.finish()
+    }
+}
+
+impl ValidateSink for RemoteWriteConfig {
+    type Validated = ValidatedPrometheusRemoteWrite;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        let mut errors = Vec::new();
+
+        let endpoint = self
+            .endpoint
+            .parse::<Uri>()
+            .inspect_err(|e| errors.push(format!("endpoint: invalid URI: {e}")))
+            .ok();
+
+        if let Some(uri) = &endpoint {
+            if let Some(scheme) = uri.scheme() {
+                if *scheme != http::uri::Scheme::HTTP && *scheme != http::uri::Scheme::HTTPS {
+                    errors.push("endpoint: scheme must be http or https".to_string());
+                }
+            } else {
+                errors.push("endpoint: must include a scheme (http:// or https://)".to_string());
+            }
+            if uri.host().is_none() {
+                errors.push("endpoint: must include a host".to_string());
+            }
+        }
+
+        let headers = validate_headers(&self.request.headers, self.auth.is_some())
+            .inspect_err(|e| errors.push(format!("request.headers: {e}")))
+            .ok();
+
+        let tenant_id = self
+            .tenant_id
+            .clone()
+            .map(|template| template.confine(&self.confinement, Self::NAME, "tenant_id"))
+            .transpose()
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
+        let batch_settings = self
+            .batch
+            .batch_settings
+            .validate()
+            .and_then(|batch_settings| batch_settings.into_batcher_settings())
+            .inspect_err(|e| errors.push(format!("batch: {e}")))
+            .ok();
+
+        #[cfg(feature = "aws-core")]
+        let aws_region = match &self.auth {
+            Some(PrometheusRemoteWriteAuth::Aws(_)) => match &self.aws {
+                None => {
+                    errors.push(
+                        "aws configuration is required when using AWS authentication".to_string(),
+                    );
+                    None
+                }
+                Some(aws_config) => match aws_config.region() {
+                    Some(region) => Some(region),
+                    None => {
+                        errors.push(
+                            "aws.region is required when using AWS authentication".to_string(),
+                        );
+                        None
+                    }
+                },
+            },
+            _ => None,
+        };
+
+        match (
+            errors.is_empty(),
+            endpoint,
+            headers,
+            tenant_id,
+            batch_settings,
+        ) {
+            (true, Some(endpoint), Some(headers), Some(tenant_id), Some(batch_settings)) => {
+                Ok(ValidatedPrometheusRemoteWrite {
+                    endpoint,
+                    headers,
+                    tenant_id,
+                    batch_settings,
+                    #[cfg(feature = "aws-core")]
+                    aws_region,
+                })
+            }
+            _ => Err(errors),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 #[typetag::serde(name = "prometheus_remote_write")]
 impl SinkConfig for RemoteWriteConfig {
@@ -195,86 +310,20 @@ impl SinkConfig for RemoteWriteConfig {
     }
 
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        // Validate endpoint can be parsed as URI
-        match self.endpoint.parse::<Uri>() {
-            Ok(uri) => {
-                // Validate endpoint has scheme and host (absolute URI)
-                if let Some(scheme) = uri.scheme() {
-                    if *scheme != http::uri::Scheme::HTTP && *scheme != http::uri::Scheme::HTTPS {
-                        errors.push("endpoint: scheme must be http or https".to_string());
-                    }
-                } else {
-                    errors
-                        .push("endpoint: must include a scheme (http:// or https://)".to_string());
-                }
-                if uri.host().is_none() {
-                    errors.push("endpoint: must include a host".to_string());
-                }
-            }
-            Err(e) => {
-                errors.push(format!("endpoint: invalid URI: {e}"));
-            }
-        }
-
-        // Validate headers (format and auth conflict)
-        if let Err(e) = validate_headers(&self.request.headers, self.auth.is_some()) {
-            errors.push(format!("request.headers: {e}"));
-        }
-
-        if let Some(tenant_id) = self.tenant_id.clone()
-            && let Err(e) = tenant_id.confine(&self.confinement, Self::NAME, "tenant_id")
-        {
-            errors.push(e.to_string());
-        }
-
-        // Validate batch settings (mirrors build() call to validate/into_batcher_settings)
-        if let Err(e) = self.batch.batch_settings.validate() {
-            errors.push(format!("batch: {e}"));
-        }
-
-        #[cfg(feature = "aws-core")]
-        if let Some(PrometheusRemoteWriteAuth::Aws(_)) = &self.auth {
-            match &self.aws {
-                None => {
-                    errors.push(
-                        "aws configuration is required when using AWS authentication".to_string(),
-                    );
-                }
-                Some(aws_config) => {
-                    if aws_config.region.is_none() {
-                        errors.push(
-                            "aws.region is required when using AWS authentication".to_string(),
-                        );
-                    }
-                }
-            }
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
+        self.validate().map(|_| ())
     }
 
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let tenant_id = self
-            .tenant_id
-            .clone()
-            .map(|template| {
-                template.confine(&self.confinement, RemoteWriteConfig::NAME, "tenant_id")
-            })
-            .transpose()?;
+        let validated = self.validate().map_err(|errors| errors.join("; "))?;
 
-        let endpoint = self.endpoint.parse::<Uri>().context(UriParseSnafu)?;
+        #[cfg(feature = "aws-core")]
+        let aws_region = validated.aws_region;
+        let endpoint = validated.endpoint;
+        let tenant_id = validated.tenant_id;
+        let batch_settings = validated.batch_settings;
         let tls_settings = TlsSettings::from_options(self.tls.as_ref())?;
         let request_settings = self.request.tower.into_settings();
-        let validated_headers = Arc::new(validate_headers(
-            &self.request.headers,
-            self.auth.is_some(),
-        )?);
+        let validated_headers = Arc::new(validated.headers);
         let buckets = self.buckets.clone();
         let quantiles = self.quantiles.clone();
         let default_namespace = self.default_namespace.clone();
@@ -295,12 +344,7 @@ impl SinkConfig for RemoteWriteConfig {
             }
             #[cfg(feature = "aws-core")]
             Some(PrometheusRemoteWriteAuth::Aws(aws_auth)) => {
-                let region = self
-                    .aws
-                    .as_ref()
-                    .map(|config| config.region())
-                    .ok_or(Errors::AwsRegionRequired)?
-                    .ok_or(Errors::AwsRegionRequired)?;
+                let region = aws_region.ok_or(Errors::AwsRegionRequired)?;
                 Some(Auth::Aws {
                     credentials_provider: aws_auth
                         .credentials_provider(region.clone(), cx.proxy(), self.tls.as_ref())
@@ -343,11 +387,7 @@ impl SinkConfig for RemoteWriteConfig {
             tenant_id,
             compression: self.compression,
             aggregate: self.batch.aggregate,
-            batch_settings: self
-                .batch
-                .batch_settings
-                .validate()?
-                .into_batcher_settings()?,
+            batch_settings,
             buckets,
             quantiles,
             default_namespace,
@@ -439,6 +479,45 @@ mod tests {
             rendered.starts_with("team-"),
             "operator-controlled prefix must be preserved in rendered tenant_id"
         );
+    }
+
+    #[test]
+    fn validate_yields_remote_write_values() {
+        use crate::event::{Event, LogEvent};
+        use vrl::event_path;
+
+        let mut headers = BTreeMap::new();
+        headers.insert("X-Custom-Header".to_string(), "custom-value".to_string());
+
+        let config = RemoteWriteConfig {
+            endpoint: "https://localhost:8087/api/v1/write".to_string(),
+            request: RemoteWriteRequestConfig {
+                headers,
+                ..Default::default()
+            },
+            tenant_id: Some(Template::try_from("tenant-{{ org }}").unwrap()),
+            ..Default::default()
+        };
+
+        let validated = config.validate().unwrap();
+        assert_eq!(
+            validated.endpoint.to_string(),
+            "https://localhost:8087/api/v1/write"
+        );
+        assert_eq!(validated.headers.len(), 1);
+        let (name, value) = validated.headers.iter().next().unwrap();
+        assert_eq!(name.inner().as_str(), "x-custom-header");
+        assert_eq!(value, &HeaderValue::from_static("custom-value"));
+        assert_eq!(validated.batch_settings.item_limit, 1_000);
+
+        let mut event = LogEvent::default();
+        event.insert(event_path!("org"), "blue");
+        let rendered = validated
+            .tenant_id
+            .unwrap()
+            .render_string(&Event::Log(event))
+            .unwrap();
+        assert_eq!(rendered, "tenant-blue");
     }
 
     #[test]

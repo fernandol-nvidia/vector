@@ -5,11 +5,12 @@ use vector_lib::{
     config::{AcknowledgementsConfig, DataType, Input},
     configurable::configurable_component,
     sink::VectorSink,
+    stream::BatcherSettings,
 };
 
 use crate::{
     codecs::{Encoder, EncodingConfigWithFraming, SinkType},
-    config::{GenerateConfig, SinkConfig, SinkContext},
+    config::{GenerateConfig, SinkConfig, SinkContext, ValidateSink},
     sinks::{
         Healthcheck,
         opendal_common::*,
@@ -18,7 +19,7 @@ use crate::{
             partitioner::KeyPartitioner,
         },
     },
-    template::{ConfinementConfig, Template},
+    template::{ConfinedTemplate, ConfinementConfig, Template},
 };
 
 /// Configuration for the `webhdfs` sink.
@@ -101,16 +102,67 @@ impl GenerateConfig for WebHdfsConfig {
     }
 }
 
+/// Values derived while validating [`WebHdfsConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain the confined prefix template and batcher
+/// settings the sink uses is [`ValidateSink::validate`].
+#[derive(Debug)]
+pub struct ValidatedWebHdfs {
+    prefix: ConfinedTemplate,
+    batcher_settings: BatcherSettings,
+}
+
+impl ValidateSink for WebHdfsConfig {
+    type Validated = ValidatedWebHdfs;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        let mut errors = Vec::new();
+
+        let prefix = Template::try_from(self.prefix.clone())
+            .map_err(|e| format!("prefix: {e}"))
+            .and_then(|tpl| {
+                tpl.confine(&self.confinement, Self::NAME, "prefix")
+                    .map_err(|e| e.to_string())
+            })
+            .inspect_err(|e| errors.push(e.clone()))
+            .ok();
+
+        let batcher_settings = self
+            .batch
+            .into_batcher_settings()
+            .inspect_err(|e| errors.push(format!("batch: {e}")))
+            .ok();
+
+        // Validate encoding configuration (structural checks only, no I/O)
+        if let Err(e) = self.encoding.validate_structure() {
+            errors.push(format!("encoding: {e}"));
+        }
+
+        match (errors.is_empty(), prefix, batcher_settings) {
+            (true, Some(prefix), Some(batcher_settings)) => Ok(ValidatedWebHdfs {
+                prefix,
+                batcher_settings,
+            }),
+            _ => Err(errors),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 #[typetag::serde(name = "webhdfs")]
 impl SinkConfig for WebHdfsConfig {
     async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        let ValidatedWebHdfs {
+            prefix,
+            batcher_settings,
+        } = self.validate().map_err(|errors| errors.join("; "))?;
+
         let op = self.build_operator()?;
 
         let check_op = op.clone();
         let healthcheck = Box::pin(async move { Ok(check_op.check().await?) });
 
-        let sink = self.build_processor(op)?;
+        let sink = self.build_processor_with_validated(op, prefix, batcher_settings)?;
         Ok((sink, healthcheck))
     }
 
@@ -127,37 +179,7 @@ impl SinkConfig for WebHdfsConfig {
     }
 
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        // Validate template confinement for prefix.
-        // This is a purely structural check that does not require environment access.
-        match Template::try_from(self.prefix.clone()) {
-            Ok(tpl) => {
-                if let Err(e) = tpl.confine(&self.confinement, Self::NAME, "prefix") {
-                    errors.push(e.to_string());
-                }
-            }
-            Err(e) => {
-                errors.push(format!("prefix: {e}"));
-            }
-        }
-
-        // Validate batch settings structurally.
-        // This mirrors build_processor's into_batcher_settings() call.
-        if let Err(e) = self.batch.into_batcher_settings() {
-            errors.push(format!("batch: {e}"));
-        }
-
-        // Validate encoding configuration (structural checks only, no I/O)
-        if let Err(e) = self.encoding.validate_structure() {
-            errors.push(format!("encoding: {e}"));
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
+        self.validate().map(|_| ())
     }
 }
 
@@ -176,9 +198,20 @@ impl WebHdfsConfig {
     }
 
     pub fn build_processor(&self, op: Operator) -> crate::Result<VectorSink> {
-        // Configure our partitioning/batching.
-        let batcher_settings = self.batch.into_batcher_settings()?;
+        let ValidatedWebHdfs {
+            prefix,
+            batcher_settings,
+        } = self.validate().map_err(|errors| errors.join("; "))?;
 
+        self.build_processor_with_validated(op, prefix, batcher_settings)
+    }
+
+    fn build_processor_with_validated(
+        &self,
+        op: Operator,
+        prefix: ConfinedTemplate,
+        batcher_settings: BatcherSettings,
+    ) -> crate::Result<VectorSink> {
         let transformer = self.encoding.transformer();
         let (framer, serializer) = self.encoding.build(SinkType::MessageBased)?;
         let encoder = Encoder::<Framer>::new(framer, serializer);
@@ -194,7 +227,7 @@ impl WebHdfsConfig {
         let sink = OpenDalSink::new(
             svc,
             request_builder,
-            self.key_partitioner()?,
+            KeyPartitioner::new(prefix, None),
             batcher_settings,
         );
 
@@ -202,8 +235,8 @@ impl WebHdfsConfig {
     }
 
     pub fn key_partitioner(&self) -> crate::Result<KeyPartitioner> {
-        let prefix: Template = self.prefix.clone().try_into()?;
-        let prefix = prefix.confine(&self.confinement, Self::NAME, "prefix")?;
+        let ValidatedWebHdfs { prefix, .. } =
+            self.validate().map_err(|errors| errors.join("; "))?;
         Ok(KeyPartitioner::new(prefix, None))
     }
 }
@@ -259,6 +292,28 @@ mod tests {
             ..base_config()
         };
         assert!(config.key_partitioner().is_ok());
+    }
+
+    #[test]
+    fn validate_yields_confined_prefix() {
+        use crate::event::Event;
+        use vector_lib::event::LogEvent;
+        use vector_lib::partition::Partitioner;
+        use vrl::event_path;
+
+        let config = WebHdfsConfig {
+            prefix: "safe/{{ tenant }}/".into(),
+            ..base_config()
+        };
+        let ValidatedWebHdfs {
+            prefix,
+            batcher_settings: _,
+        } = config.validate().unwrap();
+        let partitioner = KeyPartitioner::new(prefix, None);
+        let mut event = Event::Log(LogEvent::from("x"));
+        event.as_mut_log().insert(event_path!("tenant"), "acme");
+
+        assert_eq!(partitioner.partition(&event).as_deref(), Some("safe/acme/"));
     }
 
     #[test]

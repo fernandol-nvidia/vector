@@ -295,6 +295,57 @@ pub trait SinkConfig: DynClone + NamedComponent + core::fmt::Debug + Send + Sync
     fn acknowledgements(&self) -> &AcknowledgementsConfig;
 }
 
+/// Environment-free validation that yields the values `build()` needs.
+///
+/// [`SinkConfig::validate_structure`] answers "is this config well-formed?", but nearly every
+/// check that answers it is really a *fallible pure constructor*: [`Template::confine`] produces a
+/// [`ConfinedTemplate`], `choose_one` produces an `Auth`, `into_batcher_settings` produces
+/// `BatcherSettings`. A sink that implements `validate_structure` directly must discard those
+/// values and then recompute them in [`SinkConfig::build`], which means every structural check
+/// exists twice and the two copies drift.
+///
+/// This trait removes the duplication: `validate` performs the checks *and keeps their results* in
+/// [`Self::Validated`]. A sink then wires both phases to it:
+///
+/// ```ignore
+/// fn validate_structure(&self) -> Result<(), Vec<String>> {
+///     self.validate().map(|_| ())
+/// }
+///
+/// async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+///     let validated = self.validate().map_err(|errs| errs.join("; "))?;
+///     // side effects only from here
+/// }
+/// ```
+///
+/// `validate` runs twice at startup, which is intentional and cheap: it is pure by contract, so
+/// re-running it costs microseconds and avoids threading state from config compilation through to
+/// the topology builder.
+///
+/// # Contract
+///
+/// Implementations must be **pure**: no network, no filesystem, no credential resolution, no task
+/// spawning. They may parse, confine templates, and assemble in-memory values. Prefer accumulating
+/// every error into the returned `Vec` rather than returning only the first, so a single
+/// `vector validate` run reports all of a sink's problems at once.
+///
+/// [`Template::confine`]: crate::template::Template::confine
+/// [`ConfinedTemplate`]: crate::template::ConfinedTemplate
+pub trait ValidateSink {
+    /// The values derived while validating, consumed by [`SinkConfig::build`].
+    ///
+    /// Use `()` for a sink whose checks produce nothing `build` needs.
+    type Validated;
+
+    /// Validates this configuration without touching the environment, returning the values
+    /// derived along the way.
+    ///
+    /// # Errors
+    ///
+    /// Returns every validation error found, not just the first.
+    fn validate(&self) -> Result<Self::Validated, Vec<String>>;
+}
+
 dyn_clone::clone_trait_object!(SinkConfig);
 
 #[derive(Clone, Debug)]

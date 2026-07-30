@@ -4,13 +4,15 @@ use futures_util::FutureExt;
 use tower::ServiceBuilder;
 use vector_lib::{
     configurable::configurable_component, lookup::lookup_v2::OptionalValuePath,
-    sensitive_string::SensitiveString, sink::VectorSink,
+    sensitive_string::SensitiveString, sink::VectorSink, stream::BatcherSettings,
 };
 
 use super::{request_builder::HecMetricsRequestBuilder, sink::HecMetricsSink};
 
 use crate::{
-    config::{AcknowledgementsConfig, GenerateConfig, Input, SinkConfig, SinkContext},
+    config::{
+        AcknowledgementsConfig, GenerateConfig, Input, SinkConfig, SinkContext, ValidateSink,
+    },
     http::HttpClient,
     sinks::{
         Healthcheck,
@@ -147,28 +149,76 @@ impl GenerateConfig for HecMetricsSinkConfig {
     }
 }
 
+/// Values derived while validating [`HecMetricsSinkConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain the confined templates and batch settings the
+/// sink renders with is [`ValidateSink::validate`].
+#[derive(Debug)]
+pub struct ValidatedHecMetricsSink {
+    sourcetype: Option<ConfinedTemplate>,
+    source: Option<ConfinedTemplate>,
+    index: Option<ConfinedTemplate>,
+    batch_settings: BatcherSettings,
+}
+
+impl ValidateSink for HecMetricsSinkConfig {
+    type Validated = ValidatedHecMetricsSink;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        let mut errors = Vec::new();
+
+        let sourcetype = self
+            .sourcetype
+            .clone()
+            .map(|t| t.confine(&self.confinement, Self::NAME, "sourcetype"))
+            .transpose()
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
+        let source = self
+            .source
+            .clone()
+            .map(|t| t.confine(&self.confinement, Self::NAME, "source"))
+            .transpose()
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
+        let index = self
+            .index
+            .clone()
+            .map(|t| t.confine(&self.confinement, Self::NAME, "index"))
+            .transpose()
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
+        let batch_settings = self
+            .batch
+            .into_batcher_settings()
+            .inspect_err(|e| errors.push(format!("batch: {e}")))
+            .ok();
+
+        match (errors.is_empty(), sourcetype, source, index, batch_settings) {
+            (true, Some(sourcetype), Some(source), Some(index), Some(batch_settings)) => {
+                Ok(ValidatedHecMetricsSink {
+                    sourcetype,
+                    source,
+                    index,
+                    batch_settings,
+                })
+            }
+            _ => Err(errors),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 #[typetag::serde(name = "splunk_hec_metrics")]
 impl SinkConfig for HecMetricsSinkConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        let validated = self.validate().map_err(|errors| errors.join("; "))?;
+
         let templated_field_keys =
             compute_templated_field_keys(&self.index, &self.source, &self.sourcetype);
-
-        let confined_sourcetype = self
-            .sourcetype
-            .clone()
-            .map(|t| t.confine(&self.confinement, Self::NAME, "sourcetype"))
-            .transpose()?;
-        let confined_source = self
-            .source
-            .clone()
-            .map(|t| t.confine(&self.confinement, Self::NAME, "source"))
-            .transpose()?;
-        let confined_index = self
-            .index
-            .clone()
-            .map(|t| t.confine(&self.confinement, Self::NAME, "index"))
-            .transpose()?;
 
         let client = create_client(self.tls.as_ref(), cx.proxy())?;
         let healthcheck = build_healthcheck(
@@ -177,14 +227,7 @@ impl SinkConfig for HecMetricsSinkConfig {
             client.clone(),
         )
         .boxed();
-        let sink = self.build_processor(
-            client,
-            cx,
-            confined_sourcetype,
-            confined_source,
-            confined_index,
-            templated_field_keys, // passed to encoder, not per-event metadata
-        )?;
+        let sink = self.build_processor(client, cx, validated, templated_field_keys)?;
         Ok((sink, healthcheck))
     }
 
@@ -201,37 +244,7 @@ impl SinkConfig for HecMetricsSinkConfig {
     }
 
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        if let Some(sourcetype) = self.sourcetype.clone()
-            && let Err(e) = sourcetype.confine(&self.confinement, Self::NAME, "sourcetype")
-        {
-            errors.push(e.to_string());
-        }
-
-        if let Some(source) = self.source.clone()
-            && let Err(e) = source.confine(&self.confinement, Self::NAME, "source")
-        {
-            errors.push(e.to_string());
-        }
-
-        if let Some(index) = self.index.clone()
-            && let Err(e) = index.confine(&self.confinement, Self::NAME, "index")
-        {
-            errors.push(e.to_string());
-        }
-
-        // Validate batch settings before building the sink
-        // (mirrors build_processor's self.batch.into_batcher_settings())
-        if let Err(e) = self.batch.validate() {
-            errors.push(format!("batch: {e}"));
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
+        self.validate().map(|_| ())
     }
 }
 
@@ -254,11 +267,17 @@ impl HecMetricsSinkConfig {
         &self,
         client: HttpClient,
         _: SinkContext,
-        sourcetype: Option<ConfinedTemplate>,
-        source: Option<ConfinedTemplate>,
-        index: Option<ConfinedTemplate>,
+        validated: ValidatedHecMetricsSink,
+        // Feeds the encoder rather than per-event metadata.
         templated_field_keys: Box<[String]>,
     ) -> crate::Result<VectorSink> {
+        let ValidatedHecMetricsSink {
+            sourcetype,
+            source,
+            index,
+            batch_settings,
+        } = validated;
+
         let ack_client = if self.acknowledgements.indexer_acknowledgements_enabled {
             Some(client.clone())
         } else {
@@ -290,8 +309,6 @@ impl HecMetricsSinkConfig {
             self.acknowledgements.clone(),
         );
 
-        let batch_settings = self.batch.into_batcher_settings()?;
-
         let sink = HecMetricsSink {
             service,
             batch_settings,
@@ -304,5 +321,75 @@ impl HecMetricsSinkConfig {
         };
 
         Ok(VectorSink::from_event_streamsink(sink))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vector_lib::{
+        event::{Metric, MetricKind, MetricValue},
+        metric_tags,
+    };
+
+    use super::*;
+    use crate::template::ConfinementConfig;
+
+    #[test]
+    fn validate_yields_confined_templates_and_batch_settings() {
+        let config = HecMetricsSinkConfig {
+            default_namespace: None,
+            default_token: "test-token".to_string().into(),
+            endpoint: "http://localhost:8088".to_string(),
+            host_key: config_host_key(),
+            index: Some(Template::try_from("index-{{ tags.env }}").unwrap()),
+            sourcetype: Some(Template::try_from("type-{{ tags.env }}").unwrap()),
+            source: Some(Template::try_from("source-{{ tags.env }}").unwrap()),
+            compression: Compression::default(),
+            batch: BatchConfig::default(),
+            request: TowerRequestConfig::default(),
+            tls: None,
+            acknowledgements: Default::default(),
+            confinement: ConfinementConfig::default(),
+        };
+
+        let validated = config.validate().expect("config is valid");
+
+        let metric = Metric::new(
+            "cpu",
+            MetricKind::Absolute,
+            MetricValue::Gauge { value: 1.0 },
+        )
+        .with_tags(Some(metric_tags! {
+            "env".to_string() => "prod".to_string(),
+        }));
+
+        assert_eq!(
+            validated
+                .index
+                .as_ref()
+                .unwrap()
+                .render_string(&metric)
+                .unwrap(),
+            "index-prod"
+        );
+        assert_eq!(
+            validated
+                .sourcetype
+                .as_ref()
+                .unwrap()
+                .render_string(&metric)
+                .unwrap(),
+            "type-prod"
+        );
+        assert_eq!(
+            validated
+                .source
+                .as_ref()
+                .unwrap()
+                .render_string(&metric)
+                .unwrap(),
+            "source-prod"
+        );
+        assert!(validated.batch_settings.item_limit > 0);
     }
 }

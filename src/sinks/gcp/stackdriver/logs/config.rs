@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use http::{Request, Uri};
 use hyper::Body;
 use snafu::Snafu;
-use vector_lib::lookup::lookup_v2::ConfigValuePath;
+use vector_lib::{lookup::lookup_v2::ConfigValuePath, stream::BatcherSettings};
 use vrl::value::Kind;
 
 use super::{
@@ -244,47 +244,120 @@ fn label_examples() -> HashMap<String, String> {
 
 impl_generate_config_from_default!(StackdriverConfig);
 
-#[async_trait::async_trait]
-#[typetag::serde(name = "gcp_stackdriver_logs")]
-impl SinkConfig for StackdriverConfig {
-    async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+/// Values derived while validating [`StackdriverConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain the confined templates the sink renders with
+/// is [`ValidateSink::validate`].
+#[derive(Debug)]
+pub struct ValidatedStackdriverLogs {
+    log_id: ConfinedTemplate,
+    resource: ConfinedStackdriverResource,
+    label_config: ConfinedStackdriverLabelConfig,
+    batch_settings: BatcherSettings,
+}
+
+impl ValidateSink for StackdriverConfig {
+    type Validated = ValidatedStackdriverLogs;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        let mut errors = Vec::new();
+
+        let batch_settings = self
+            .batch
+            .validate()
+            .and_then(|b| b.limit_max_bytes(MAX_BATCH_PAYLOAD_SIZE))
+            .and_then(|b| b.into_batcher_settings())
+            .inspect_err(|e| errors.push(format!("batch: {e}")))
+            .ok();
+
         let log_id = self
             .log_id
             .clone()
-            .confine(&self.confinement, Self::NAME, "log_id")?;
+            .confine(&self.confinement, Self::NAME, "log_id")
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
 
         // Confine every label value template. Stackdriver identifies
         // destinations by `resource.type + resource.labels`, so an event-
         // controlled label like `resource.labels.zone: "{{ zone }}"` is as
         // steerable as `log_id` unless we confine it too. Same for arbitrary
         // log-entry labels in `label_config.labels`.
-        let resource = ConfinedStackdriverResource {
+        let mut resource_labels = HashMap::with_capacity(self.resource.labels.len());
+        let mut resource_labels_valid = true;
+        for (k, v) in self.resource.labels.clone() {
+            let label = v
+                .confine(&self.confinement, Self::NAME, "resource.labels")
+                .inspect_err(|e| errors.push(format!("resource.labels.{}: {}", k, e)))
+                .ok();
+            match label {
+                Some(v) => {
+                    resource_labels.insert(k, v);
+                }
+                None => {
+                    resource_labels_valid = false;
+                }
+            }
+        }
+        let resource = resource_labels_valid.then(|| ConfinedStackdriverResource {
             type_: self.resource.type_.clone(),
-            labels: self
-                .resource
-                .labels
-                .clone()
-                .into_iter()
-                .map(|(k, v)| {
-                    v.confine(&self.confinement, Self::NAME, "resource.labels")
-                        .map(|v| (k, v))
-                })
-                .collect::<crate::Result<_>>()?,
-        };
+            labels: resource_labels,
+        });
 
-        let label_config = ConfinedStackdriverLabelConfig {
+        let mut labels = HashMap::with_capacity(self.label_config.labels.len());
+        let mut labels_valid = true;
+        for (k, v) in self.label_config.labels.clone() {
+            let label = v
+                .confine(&self.confinement, Self::NAME, "label_config.labels")
+                .inspect_err(|e| errors.push(format!("labels.{}: {}", k, e)))
+                .ok();
+            match label {
+                Some(v) => {
+                    labels.insert(k, v);
+                }
+                None => {
+                    labels_valid = false;
+                }
+            }
+        }
+        let label_config = labels_valid.then(|| ConfinedStackdriverLabelConfig {
             labels_key: self.label_config.labels_key.clone(),
-            labels: self
-                .label_config
-                .labels
-                .clone()
-                .into_iter()
-                .map(|(k, v)| {
-                    v.confine(&self.confinement, Self::NAME, "label_config.labels")
-                        .map(|v| (k, v))
+            labels,
+        });
+
+        match (
+            errors.is_empty(),
+            batch_settings,
+            log_id,
+            resource,
+            label_config,
+        ) {
+            (true, Some(batch_settings), Some(log_id), Some(resource), Some(label_config)) => {
+                Ok(ValidatedStackdriverLogs {
+                    log_id,
+                    resource,
+                    label_config,
+                    batch_settings,
                 })
-                .collect::<crate::Result<_>>()?,
-        };
+            }
+            _ => Err(errors),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+#[typetag::serde(name = "gcp_stackdriver_logs")]
+impl SinkConfig for StackdriverConfig {
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        self.validate().map(|_| ())
+    }
+
+    async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        let ValidatedStackdriverLogs {
+            log_id,
+            resource,
+            label_config,
+            batch_settings,
+        } = self.validate().map_err(|errors| errors.join("; "))?;
 
         let auth = self.auth.build(Scope::LoggingWrite).await?;
 
@@ -298,12 +371,6 @@ impl SinkConfig for StackdriverConfig {
                 self.severity_key.clone(),
             ),
         };
-
-        let batch_settings = self
-            .batch
-            .validate()?
-            .limit_max_bytes(MAX_BATCH_PAYLOAD_SIZE)?
-            .into_batcher_settings()?;
 
         let request_limits = self.request.into_settings();
 
@@ -348,48 +415,6 @@ impl SinkConfig for StackdriverConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
-
-    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        // Validate batch settings (max_bytes must not exceed 10MB API limit)
-        if let Err(e) = self
-            .batch
-            .validate()
-            .and_then(|b| b.limit_max_bytes(MAX_BATCH_PAYLOAD_SIZE))
-        {
-            errors.push(format!("batch: {e}"));
-        }
-
-        // Validate log_id confinement
-        if let Err(e) = self
-            .log_id
-            .clone()
-            .confine(&self.confinement, Self::NAME, "log_id")
-        {
-            errors.push(e.to_string());
-        }
-
-        // Validate resource.labels confinement
-        for (k, v) in self.resource.labels.clone().into_iter() {
-            if let Err(e) = v.confine(&self.confinement, Self::NAME, "resource.labels") {
-                errors.push(format!("resource.labels.{}: {}", k, e));
-            }
-        }
-
-        // Validate label_config.labels confinement
-        for (k, v) in self.label_config.labels.clone().into_iter() {
-            if let Err(e) = v.confine(&self.confinement, Self::NAME, "label_config.labels") {
-                errors.push(format!("labels.{}: {}", k, e));
-            }
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
-    }
 }
 
 async fn healthcheck(client: HttpClient, auth: GcpAuthenticator, uri: Uri) -> crate::Result<()> {
@@ -414,7 +439,16 @@ async fn healthcheck(client: HttpClient, auth: GcpAuthenticator, uri: Uri) -> cr
 
 #[cfg(test)]
 mod tests {
-    use crate::template::{ConfinementConfig, Template};
+    use std::collections::HashMap;
+
+    use vrl::event_path;
+
+    use super::*;
+    use crate::{
+        config::ValidateSink,
+        event::{Event, LogEvent},
+        template::{ConfinementConfig, Template},
+    };
 
     #[test]
     fn confinement_rejects_unconfined_log_id() {
@@ -440,5 +474,50 @@ mod tests {
         let config = ConfinementConfig::default();
         let result = template.confine(&config, "gcp_stackdriver_logs", "log_id");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_yields_confined_templates() {
+        let config = StackdriverConfig {
+            log_id: Template::try_from("events-{{ env }}").unwrap(),
+            resource: StackdriverResource {
+                type_: "generic_node".to_string(),
+                labels: HashMap::from([(
+                    "zone".to_string(),
+                    Template::try_from("zone-{{ env }}").unwrap(),
+                )]),
+            },
+            label_config: StackdriverLabelConfig {
+                labels_key: None,
+                labels: HashMap::from([(
+                    "label".to_string(),
+                    Template::try_from("label-{{ env }}").unwrap(),
+                )]),
+            },
+            ..Default::default()
+        };
+
+        let validated = config.validate().expect("config is valid");
+
+        let mut event = LogEvent::from("message");
+        event.insert(event_path!("env"), "prod");
+        let event = Event::from(event);
+
+        assert_eq!(
+            validated.log_id.render_string(&event).unwrap(),
+            "events-prod"
+        );
+        assert_eq!(
+            validated.resource.labels["zone"]
+                .render_string(&event)
+                .unwrap(),
+            "zone-prod"
+        );
+        assert_eq!(
+            validated.label_config.labels["label"]
+                .render_string(&event)
+                .unwrap(),
+            "label-prod"
+        );
     }
 }

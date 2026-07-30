@@ -1,11 +1,12 @@
 use crate::{
-    http::{Auth, MaybeAuth},
+    http::Auth,
     sinks::{
         doris::{
-            DorisConfig, client::ThreadSafeDorisSinkClient, request_builder::DorisRequestBuilder,
+            client::ThreadSafeDorisSinkClient,
+            config::{DorisConfig, ValidatedDoris, ValidatedDorisEndpoint},
+            request_builder::DorisRequestBuilder,
         },
         prelude::Compression,
-        util::UriSerde,
     },
     tls::TlsSettings,
 };
@@ -21,16 +22,12 @@ pub struct DorisCommon {
 }
 
 impl DorisCommon {
-    pub async fn parse_config(config: &DorisConfig, endpoint: &UriSerde) -> crate::Result<Self> {
-        if endpoint.uri.host().is_none() {
-            return Err(
-                format!("Invalid host: {}, host must include hostname", endpoint.uri).into(),
-            );
-        }
-
-        // basic auth must be some for now
-        let auth = config.auth.choose_one(&endpoint.auth)?;
-        let base_url = endpoint.uri.clone();
+    pub fn parse_config(
+        config: &DorisConfig,
+        endpoint: &ValidatedDorisEndpoint,
+    ) -> crate::Result<Self> {
+        let auth = endpoint.auth().cloned();
+        let base_url = endpoint.base_url().clone();
         let tls_settings = TlsSettings::from_options(config.tls.as_ref())?;
 
         // Build encoder from the encoding configuration
@@ -50,10 +47,14 @@ impl DorisCommon {
             tls_settings,
         })
     }
-    pub async fn parse_many(config: &DorisConfig) -> crate::Result<Vec<Self>> {
+
+    pub fn parse_many(
+        config: &DorisConfig,
+        validated: &ValidatedDoris,
+    ) -> crate::Result<Vec<Self>> {
         let mut commons = Vec::new();
-        for endpoint in config.endpoints.iter() {
-            commons.push(Self::parse_config(config, endpoint).await?);
+        for endpoint in validated.endpoints() {
+            commons.push(Self::parse_config(config, endpoint)?);
         }
         Ok(commons)
     }

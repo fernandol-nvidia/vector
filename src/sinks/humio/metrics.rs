@@ -13,11 +13,12 @@ use vector_lib::{
 
 use super::{
     config_host_key,
-    logs::{HOST, HumioLogsConfig},
+    logs::{HOST, HumioLogsConfig, ValidatedHumioLogsSink},
 };
 use crate::{
     config::{
         AcknowledgementsConfig, GenerateConfig, Input, SinkConfig, SinkContext, TransformContext,
+        ValidateSink,
     },
     event::{Event, EventArray, EventContainer},
     sinks::{
@@ -157,20 +158,38 @@ impl GenerateConfig for HumioMetricsConfig {
     }
 }
 
+/// Values derived while validating [`HumioMetricsConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain the delegated Humio logs config and its
+/// validated values is [`ValidateSink::validate`].
+#[derive(Debug)]
+pub struct ValidatedHumioMetricsSink {
+    logs_config: HumioLogsConfig,
+    logs: ValidatedHumioLogsSink,
+}
+
+impl ValidateSink for HumioMetricsConfig {
+    type Validated = ValidatedHumioMetricsSink;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        let logs_config = self.build_logs_config();
+        let logs = logs_config.validate_with_component_type(Self::NAME)?;
+        Ok(ValidatedHumioMetricsSink { logs_config, logs })
+    }
+}
+
 #[async_trait::async_trait]
 #[typetag::serde(name = "humio_metrics")]
 impl SinkConfig for HumioMetricsConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        let ValidatedHumioMetricsSink { logs_config, logs } =
+            self.validate().map_err(|errors| errors.join("; "))?;
+
         let transform = self
             .transform
             .build_transform(&TransformContext::new_with_globals(cx.globals.clone()));
 
-        let sink = self.build_logs_config();
-
-        // Route through the inner Humio helper threaded with our own component
-        // type, so per-template security warnings carry `humio_metrics` rather
-        // than the delegated `humio_logs`/`splunk_hec_logs`.
-        let (sink, healthcheck) = sink.build_with_component_type(cx, Self::NAME)?;
+        let (sink, healthcheck) = logs_config.build_with_validated(cx, logs)?;
 
         let sink = HumioMetricsSink {
             inner: sink,
@@ -192,10 +211,7 @@ impl SinkConfig for HumioMetricsConfig {
     }
 
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        // Delegate to the humio_logs config validation with the outer component name
-        self.build_logs_config()
-            .build_hec_config()
-            .validate_structure()
+        self.validate().map(|_| ())
     }
 }
 

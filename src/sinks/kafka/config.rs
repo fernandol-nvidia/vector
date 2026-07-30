@@ -282,47 +282,29 @@ impl GenerateConfig for KafkaSinkConfig {
     }
 }
 
-#[async_trait::async_trait]
-#[typetag::serde(name = "kafka")]
-impl SinkConfig for KafkaSinkConfig {
-    async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+/// Values derived while validating [`KafkaSinkConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain the confined topic template the sink renders
+/// with is [`ValidateSink::validate`].
+#[derive(Debug)]
+pub struct ValidatedKafkaSink {
+    topic: ConfinedTemplate,
+}
+
+impl ValidateSink for KafkaSinkConfig {
+    type Validated = ValidatedKafkaSink;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        let mut errors = Vec::new();
+
         let topic = self
             .topic
             .clone()
-            .confine(&self.confinement, Self::NAME, "topic")?;
-        let sink = KafkaSink::new(self.clone(), topic.clone())?;
-        let hc = healthcheck(self.clone(), topic, cx.healthcheck.clone()).boxed();
-        Ok((VectorSink::from_event_streamsink(sink), hc))
-    }
-
-    fn confinement_config(&self) -> Option<&crate::template::ConfinementConfig> {
-        Some(&self.confinement)
-    }
-
-    fn input(&self) -> Input {
-        let requirements = Requirement::empty().optional_meaning("timestamp", Kind::timestamp());
-
-        Input::new(self.encoding.config().input_type()).with_schema_requirement(requirements)
-    }
-
-    fn acknowledgements(&self) -> &AcknowledgementsConfig {
-        &self.acknowledgements
-    }
-
-    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        if let Err(e) = self
-            .topic
-            .clone()
             .confine(&self.confinement, Self::NAME, "topic")
-        {
-            errors.push(e.to_string());
-        }
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
 
-        // Check for conflicts between batch options and librdkafka_options
-        // These mirror the checks in to_rdkafka() so validate --no-environment
-        // catches them before boot.
+        // Check for conflicts between batch options and librdkafka_options.
         if let Some(value) = self.batch.timeout_secs {
             let key = "queue.buffering.max.ms";
             if let Some(val) = self.librdkafka_options.get(key) {
@@ -360,11 +342,40 @@ impl SinkConfig for KafkaSinkConfig {
             errors.push(format!("encoding: {e}"));
         }
 
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
+        match (errors.is_empty(), topic) {
+            (true, Some(topic)) => Ok(ValidatedKafkaSink { topic }),
+            _ => Err(errors),
         }
+    }
+}
+
+#[async_trait::async_trait]
+#[typetag::serde(name = "kafka")]
+impl SinkConfig for KafkaSinkConfig {
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        self.validate().map(|_| ())
+    }
+
+    async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        let ValidatedKafkaSink { topic } = self.validate().map_err(|errors| errors.join("; "))?;
+
+        let sink = KafkaSink::new(self.clone(), topic.clone())?;
+        let hc = healthcheck(self.clone(), topic, cx.healthcheck.clone()).boxed();
+        Ok((VectorSink::from_event_streamsink(sink), hc))
+    }
+
+    fn confinement_config(&self) -> Option<&crate::template::ConfinementConfig> {
+        Some(&self.confinement)
+    }
+
+    fn input(&self) -> Input {
+        let requirements = Requirement::empty().optional_meaning("timestamp", Kind::timestamp());
+
+        Input::new(self.encoding.config().input_type()).with_schema_requirement(requirements)
+    }
+
+    fn acknowledgements(&self) -> &AcknowledgementsConfig {
+        &self.acknowledgements
     }
 }
 
@@ -402,6 +413,30 @@ mod tests {
         let config = ConfinementConfig::default();
         let result = template.confine(&config, "kafka", "topic");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_yields_confined_topic() {
+        use crate::{
+            config::ValidateSink,
+            event::{Event, LogEvent},
+        };
+        use vrl::event_path;
+
+        let mut config: KafkaSinkConfig =
+            serde_json::from_value(KafkaSinkConfig::generate_config()).unwrap();
+        config.topic = Template::try_from("events-{{ env }}").unwrap();
+
+        let validated = config.validate().expect("config is valid");
+
+        let mut event = LogEvent::from_str_legacy("message");
+        event.insert(event_path!("env"), "prod");
+        let event = Event::from(event);
+
+        assert_eq!(
+            validated.topic.render_string(&event).unwrap(),
+            "events-prod"
+        );
     }
 
     #[test]

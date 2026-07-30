@@ -19,14 +19,17 @@ use vector_lib::{
     configurable::configurable_component,
     request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata},
     sensitive_string::SensitiveString,
-    stream::DriverResponse,
+    stream::{BatcherSettings, DriverResponse},
 };
 
 use super::request_builder::AzureBlobRequestOptions;
 use crate::{
     Result,
     codecs::{Encoder, EncodingConfigWithFraming, SinkType},
-    config::{AcknowledgementsConfig, DataType, GenerateConfig, Input, SinkConfig, SinkContext},
+    config::{
+        AcknowledgementsConfig, DataType, GenerateConfig, Input, SinkConfig, SinkContext,
+        ValidateSink,
+    },
     event::{EventFinalizers, EventStatus, Finalizable},
     sinks::{
         Healthcheck, VectorSink,
@@ -43,7 +46,7 @@ use crate::{
             service::TowerRequestConfigDefaults,
         },
     },
-    template::{ConfinementConfig, Template},
+    template::{ConfinedTemplate, ConfinementConfig, Template},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -218,84 +221,24 @@ impl GenerateConfig for AzureBlobSinkConfig {
     }
 }
 
-#[async_trait::async_trait]
-#[typetag::serde(name = "azure_blob")]
-impl SinkConfig for AzureBlobSinkConfig {
-    async fn build(&self, cx: SinkContext) -> Result<(VectorSink, Healthcheck)> {
-        let connection_string: String = match (
-            &self.connection_string,
-            &self.account_name,
-            &self.blob_endpoint,
-        ) {
-            (Some(connstr), None, None) => connstr.inner().into(),
-            (None, Some(account_name), None) => {
-                if self.auth.is_none() {
-                    return Err(
-                        "`auth` configuration must be provided when using `account_name`".into(),
-                    );
-                }
-                format!("AccountName={}", account_name)
-            }
-            (None, None, Some(blob_endpoint)) => {
-                if self.auth.is_none() {
-                    return Err(
-                        "`auth` configuration must be provided when using `blob_endpoint`".into(),
-                    );
-                }
-                // BlobEndpoint must always end in a trailing slash
-                let blob_endpoint = if blob_endpoint.ends_with('/') {
-                    blob_endpoint.clone()
-                } else {
-                    format!("{}/", blob_endpoint)
-                };
-                format!("BlobEndpoint={}", blob_endpoint)
-            }
-            (None, None, None) => {
-                return Err("One of `connection_string`, `account_name`, or `blob_endpoint` must be provided".into());
-            }
-            (Some(_), Some(_), _) => {
-                return Err("Cannot provide both `connection_string` and `account_name`".into());
-            }
-            (Some(_), _, Some(_)) => {
-                return Err("Cannot provide both `connection_string` and `blob_endpoint`".into());
-            }
-            (_, Some(_), Some(_)) => {
-                return Err("Cannot provide both `account_name` and `blob_endpoint`".into());
-            }
-        };
+/// Values derived while validating [`AzureBlobSinkConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain the parsed connection string, container URL,
+/// confined blob prefix, and batch settings the sink uses is [`ValidateSink::validate`].
+#[derive(Debug)]
+pub struct ValidatedAzureBlob {
+    parsed_connection_string: ParsedConnectionString,
+    container_url: Url,
+    blob_prefix: ConfinedTemplate,
+    batcher_settings: BatcherSettings,
+}
 
-        let client = build_client(
-            self.auth.clone(),
-            connection_string.clone(),
-            self.container_name.clone(),
-            cx.proxy(),
-            self.tls.clone(),
-        )
-        .await?;
+impl ValidateSink for AzureBlobSinkConfig {
+    type Validated = ValidatedAzureBlob;
 
-        let healthcheck = build_healthcheck(self.container_name.clone(), Arc::clone(&client))?;
-        let sink = self.build_processor(client)?;
-        Ok((sink, healthcheck))
-    }
-
-    fn confinement_config(&self) -> Option<&crate::template::ConfinementConfig> {
-        Some(&self.confinement)
-    }
-
-    fn input(&self) -> Input {
-        Input::new(self.encoding.config().1.input_type() & DataType::Log)
-    }
-
-    fn acknowledgements(&self) -> &AcknowledgementsConfig {
-        &self.acknowledgements
-    }
-
-    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        use crate::sinks::azure_common::connection_string::ParsedConnectionString;
-
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
         let mut errors = Vec::new();
 
-        // Mirror credential shape checks from build()
         match (
             &self.connection_string,
             &self.account_name,
@@ -329,69 +272,172 @@ impl SinkConfig for AzureBlobSinkConfig {
             _ => {}
         }
 
-        // Parse connection_string to catch malformed strings early
-        // (mirrors ParsedConnectionString::parse in build_client)
-        if let Some(connstr) = &self.connection_string {
-            if let Err(e) = ParsedConnectionString::parse(connstr.inner()) {
-                errors.push(format!("connection_string: invalid format: {e}"));
+        let parsed_connection_string = match (
+            &self.connection_string,
+            &self.account_name,
+            &self.blob_endpoint,
+        ) {
+            (Some(connstr), _, _) => ParsedConnectionString::parse(connstr.inner())
+                .inspect_err(|e| errors.push(format!("connection_string: invalid format: {e}")))
+                .ok(),
+            (None, Some(account_name), None) => {
+                ParsedConnectionString::parse(&format!("AccountName={account_name}"))
+                    .inspect_err(|e| {
+                        errors.push(format!("Invalid connection string: {e}"));
+                    })
+                    .ok()
             }
-            // Check for duplicate auth: connection_string auth + auth field
-            if self.auth.is_some() {
-                // Re-parse to check auth type
-                if let Ok(parsed) = ParsedConnectionString::parse(connstr.inner()) {
-                    match parsed.auth() {
-                        crate::sinks::azure_common::connection_string::Auth::SharedKey {
-                            ..
-                        }
-                        | crate::sinks::azure_common::connection_string::Auth::Sas { .. } => {
-                            errors.push(
-                                "Cannot use both `connection_string` with embedded credentials and `auth`".to_string(),
-                            );
-                        }
-                        crate::sinks::azure_common::connection_string::Auth::None => {}
-                    }
+            (None, None, Some(blob_endpoint)) => {
+                let blob_endpoint = if blob_endpoint.ends_with('/') {
+                    blob_endpoint.clone()
+                } else {
+                    format!("{blob_endpoint}/")
+                };
+                ParsedConnectionString::parse(&format!("BlobEndpoint={blob_endpoint}"))
+                    .inspect_err(|e| {
+                        errors.push(format!("Invalid connection string: {e}"));
+                    })
+                    .ok()
+            }
+            _ => None,
+        };
+
+        if let (Some(parsed), Some(auth)) = (&parsed_connection_string, &self.auth) {
+            match (parsed.auth(), auth) {
+                (Auth::Sas { .. }, AzureAuthentication::Specific(..)) => {
+                    errors.push(
+                        "Cannot use both SAS token and another Azure Authentication method at the same time"
+                            .to_string(),
+                    );
                 }
+                (Auth::SharedKey { .. }, AzureAuthentication::Specific(..)) => {
+                    errors.push(
+                        "Cannot use both Shared Key and another Azure Authentication method at the same time"
+                            .to_string(),
+                    );
+                }
+                #[cfg(test)]
+                (Auth::None, AzureAuthentication::MockCredential) => {}
+                #[cfg(test)]
+                (_, AzureAuthentication::MockCredential) => {
+                    errors.push(
+                        "Cannot use both connection string auth and mock credential at the same time"
+                            .to_string(),
+                    );
+                }
+                _ => {}
             }
         }
 
-        if let Err(e) =
-            self.blob_prefix
-                .clone()
-                .confine(&self.confinement, Self::NAME, "blob_prefix")
-        {
-            errors.push(e.to_string());
-        }
+        let container_url = parsed_connection_string.as_ref().and_then(|parsed| {
+            let container_url = parsed
+                .container_url(&self.container_name)
+                .inspect_err(|e| errors.push(format!("Failed to build container URL: {e}")))
+                .ok()?;
 
-        // Validate blob_endpoint URL can be parsed (mirrors build_client's URL synthesis)
-        if let Some(blob_endpoint) = &self.blob_endpoint {
-            // BlobEndpoint must end in a trailing slash, add if missing
+            Url::parse(&container_url)
+                .inspect_err(|e| {
+                    if self.connection_string.is_none()
+                        && self.account_name.is_none()
+                        && self.blob_endpoint.is_some()
+                    {
+                        errors.push(format!("blob_endpoint: invalid URL: {e}"));
+                    } else {
+                        errors.push(format!("Invalid container URL: {e}"));
+                    }
+                })
+                .ok()
+        });
+
+        if let Some(blob_endpoint) = &self.blob_endpoint
+            && (self.connection_string.is_some() || self.account_name.is_some())
+        {
             let endpoint_url = if blob_endpoint.ends_with('/') {
                 blob_endpoint.clone()
             } else {
-                format!("{}/", blob_endpoint)
+                format!("{blob_endpoint}/")
             };
-            // Synthesize the container URL the same way build_client does
             let container_url = format!("{}{}", endpoint_url, self.container_name);
             if let Err(e) = Url::parse(&container_url) {
                 errors.push(format!("blob_endpoint: invalid URL: {e}"));
             }
         }
 
-        // Validate encoding configuration (structural checks only, no I/O)
+        let blob_prefix = self
+            .blob_prefix
+            .clone()
+            .confine(&self.confinement, Self::NAME, "blob_prefix")
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
         if let Err(e) = self.encoding.validate_structure() {
             errors.push(format!("encoding: {e}"));
         }
 
-        // Validate batch settings (mirrors build_processor's into_batcher_settings)
-        if let Err(e) = self.batch.into_batcher_settings() {
-            errors.push(format!("batch: {e}"));
-        }
+        let batcher_settings = self
+            .batch
+            .into_batcher_settings()
+            .inspect_err(|e| errors.push(format!("batch: {e}")))
+            .ok();
 
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
+        match (
+            errors.is_empty(),
+            parsed_connection_string,
+            container_url,
+            blob_prefix,
+            batcher_settings,
+        ) {
+            (
+                true,
+                Some(parsed_connection_string),
+                Some(container_url),
+                Some(blob_prefix),
+                Some(batcher_settings),
+            ) => Ok(ValidatedAzureBlob {
+                parsed_connection_string,
+                container_url,
+                blob_prefix,
+                batcher_settings,
+            }),
+            _ => Err(errors),
         }
+    }
+}
+
+#[async_trait::async_trait]
+#[typetag::serde(name = "azure_blob")]
+impl SinkConfig for AzureBlobSinkConfig {
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        self.validate().map(|_| ())
+    }
+
+    async fn build(&self, cx: SinkContext) -> Result<(VectorSink, Healthcheck)> {
+        let validated = self.validate().map_err(|errors| errors.join("; "))?;
+
+        let client = build_client(
+            self.auth.clone(),
+            &validated.parsed_connection_string,
+            validated.container_url.clone(),
+            cx.proxy(),
+            self.tls.clone(),
+        )
+        .await?;
+
+        let healthcheck = build_healthcheck(self.container_name.clone(), Arc::clone(&client))?;
+        let sink = self.build_processor(client, validated)?;
+        Ok((sink, healthcheck))
+    }
+
+    fn confinement_config(&self) -> Option<&crate::template::ConfinementConfig> {
+        Some(&self.confinement)
+    }
+
+    fn input(&self) -> Input {
+        Input::new(self.encoding.config().1.input_type() & DataType::Log)
+    }
+
+    fn acknowledgements(&self) -> &AcknowledgementsConfig {
+        &self.acknowledgements
     }
 }
 
@@ -400,14 +446,21 @@ const DEFAULT_FILENAME_TIME_FORMAT: &str = "%s";
 const DEFAULT_FILENAME_APPEND_UUID: bool = true;
 
 impl AzureBlobSinkConfig {
-    pub fn build_processor(&self, client: Arc<BlobContainerClient>) -> crate::Result<VectorSink> {
+    pub fn build_processor(
+        &self,
+        client: Arc<BlobContainerClient>,
+        validated: ValidatedAzureBlob,
+    ) -> crate::Result<VectorSink> {
+        let ValidatedAzureBlob {
+            blob_prefix,
+            batcher_settings,
+            ..
+        } = validated;
+
         let request_limits = self.request.into_settings();
         let service = ServiceBuilder::new()
             .settings(request_limits, AzureBlobRetryLogic)
             .service(AzureBlobService::new(client));
-
-        // Configure our partitioning/batching.
-        let batcher_settings = self.batch.into_batcher_settings()?;
 
         let blob_time_format = self
             .blob_time_format
@@ -433,26 +486,22 @@ impl AzureBlobSinkConfig {
         let sink = AzureBlobSink::new(
             service,
             request_options,
-            self.key_partitioner()?,
+            self.key_partitioner(blob_prefix),
             batcher_settings,
         );
 
         Ok(VectorSink::from_event_streamsink(sink))
     }
 
-    pub fn key_partitioner(&self) -> crate::Result<KeyPartitioner> {
-        let tpl = self
-            .blob_prefix
-            .clone()
-            .confine(&self.confinement, Self::NAME, "blob_prefix")?;
-        Ok(KeyPartitioner::new(tpl, None))
+    pub const fn key_partitioner(&self, blob_prefix: ConfinedTemplate) -> KeyPartitioner {
+        KeyPartitioner::new(blob_prefix, None)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::template::ConfinementConfig;
+    use crate::{config::ValidateSink, template::ConfinementConfig};
 
     #[test]
     fn generate_config() {
@@ -495,6 +544,52 @@ mod tests {
             .as_mut_log()
             .insert(event_path!("tenant"), "../../escape");
         assert!(template.render_string(&event).is_err());
+    }
+
+    #[test]
+    fn validate_yields_confined_blob_prefix() {
+        use crate::event::Event;
+        use vector_lib::event::LogEvent;
+        use vrl::event_path;
+
+        let config = AzureBlobSinkConfig {
+            auth: None,
+            connection_string: Some("AccountName=testaccount".to_string().into()),
+            account_name: None,
+            blob_endpoint: None,
+            container_name: "logs".to_string(),
+            blob_prefix: Template::try_from("safe/{{ tenant }}/").unwrap(),
+            blob_time_format: None,
+            blob_append_uuid: None,
+            encoding: (
+                Some(NewlineDelimitedEncoderConfig::new()),
+                JsonSerializerConfig::default(),
+            )
+                .into(),
+            compression: Compression::gzip_default(),
+            batch: BatchConfig::default(),
+            request: TowerRequestConfig::default(),
+            acknowledgements: Default::default(),
+            tls: None,
+            confinement: ConfinementConfig::default(),
+        };
+
+        let ValidatedAzureBlob {
+            container_url,
+            blob_prefix,
+            batcher_settings,
+            ..
+        } = config.validate().unwrap();
+
+        assert_eq!(
+            container_url.as_str(),
+            "https://testaccount.blob.core.windows.net/logs"
+        );
+        assert_eq!(batcher_settings.size_limit, 10_000_000);
+
+        let mut event = Event::Log(LogEvent::from("x"));
+        event.as_mut_log().insert(event_path!("tenant"), "acme");
+        assert_eq!(blob_prefix.render_string(&event).unwrap(), "safe/acme/");
     }
 
     #[test]
@@ -753,25 +848,16 @@ pub fn build_healthcheck(
 
 pub async fn build_client(
     auth: Option<AzureAuthentication>,
-    connection_string: String,
-    container_name: String,
+    parsed_connection_string: &ParsedConnectionString,
+    url: Url,
     proxy: &crate::config::ProxyConfig,
     tls: Option<AzureBlobTlsConfig>,
 ) -> crate::Result<Arc<BlobContainerClient>> {
-    // Parse connection string without legacy SDK
-    let parsed = ParsedConnectionString::parse(&connection_string)
-        .map_err(|e| format!("Invalid connection string: {e}"))?;
-    // Compose container URL (SAS appended if present)
-    let container_url = parsed
-        .container_url(&container_name)
-        .map_err(|e| format!("Failed to build container URL: {e}"))?;
-    let url = Url::parse(&container_url).map_err(|e| format!("Invalid container URL: {e}"))?;
-
     let mut credential: Option<Arc<dyn TokenCredential>> = None;
 
     // Prepare options; attach Shared Key policy if needed
     let mut options = BlobContainerClientOptions::default();
-    match (parsed.auth(), &auth) {
+    match (parsed_connection_string.auth(), &auth) {
         (Auth::None, None) => {
             warn!("No authentication method provided, requests will be anonymous.");
         }

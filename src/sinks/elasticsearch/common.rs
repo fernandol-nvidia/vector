@@ -3,20 +3,23 @@ use http::{Response, StatusCode, Uri};
 use http_body::Body as _;
 use hyper::Body;
 use serde::Deserialize;
-use snafu::ResultExt;
 use vector_lib::config::{LogNamespace, proxy::ProxyConfig};
 
+#[cfg(test)]
+use crate::config::ValidateSink;
+
 use super::{
-    ElasticsearchApiVersion, ElasticsearchEncoder, InvalidHostSnafu, Request, VersionType,
+    ElasticsearchApiVersion, ElasticsearchEncoder, Request,
+    config::{ValidatedElasticsearch, ValidatedElasticsearchEndpoint},
     request_builder::ElasticsearchRequestBuilder,
 };
 use crate::{
-    http::{HttpClient, MaybeAuth, ParameterValue, QueryParameterValue, QueryParameters},
+    http::{HttpClient, ParameterValue, QueryParameterValue, QueryParameters},
     sinks::{
         HealthcheckError,
         elasticsearch::{
             ElasticsearchAuthConfig, ElasticsearchCommonMode, ElasticsearchConfig,
-            OpenSearchServiceType, ParseError,
+            OpenSearchServiceType,
         },
         util::{UriSerde, auth::Auth, http::RequestConfig},
     },
@@ -39,50 +42,23 @@ pub struct ElasticsearchCommon {
 }
 
 impl ElasticsearchCommon {
-    pub async fn parse_config(
+    async fn parse_config(
         config: &ElasticsearchConfig,
-        endpoint: &str,
+        endpoint: &ValidatedElasticsearchEndpoint,
+        mode: &ElasticsearchCommonMode,
         proxy_config: &ProxyConfig,
         version: &mut Option<usize>,
     ) -> crate::Result<Self> {
-        // Test the configured host
-        Self::check_endpoint(endpoint)?;
-
-        let uri = endpoint.parse::<UriSerde>()?;
+        let uri = endpoint.uri();
 
         // get auth from config or uri
-        let auth = Self::extract_auth(config, proxy_config, &uri).await?;
-
-        if config.opensearch_service_type == OpenSearchServiceType::Serverless {
-            match &config.auth {
-                #[cfg(feature = "aws-core")]
-                Some(ElasticsearchAuthConfig::Aws(_)) => (),
-                _ => return Err(ParseError::OpenSearchServerlessRequiresAwsAuth.into()),
-            }
-        }
+        let auth = Self::extract_auth(config, proxy_config, uri).await?;
 
         let base_url = uri.uri.to_string().trim_end_matches('/').to_owned();
 
-        let mode = config.common_mode()?;
+        let mode = mode.clone();
 
         let tower_request = config.request.tower.into_settings();
-
-        if config.bulk.version.is_some() && config.bulk.version_type == VersionType::Internal {
-            return Err(ParseError::ExternalVersionIgnoredWithInternalVersioning.into());
-        }
-        if config.bulk.version.is_some()
-            && (config.bulk.version_type == VersionType::External
-                || config.bulk.version_type == VersionType::ExternalGte)
-            && config.id_key.is_none()
-        {
-            return Err(ParseError::ExternalVersioningWithoutDocumentID.into());
-        }
-        if config.bulk.version.is_none()
-            && (config.bulk.version_type == VersionType::External
-                || config.bulk.version_type == VersionType::ExternalGte)
-        {
-            return Err(ParseError::ExternalVersioningWithoutVersion.into());
-        }
 
         let mut query_params = config.query.clone().unwrap_or_default();
         query_params.insert(
@@ -138,9 +114,6 @@ impl ElasticsearchCommon {
         let service_type = config.opensearch_service_type;
 
         let version = if service_type == OpenSearchServiceType::Serverless {
-            if config.api_version != ElasticsearchApiVersion::Auto {
-                return Err(ParseError::ServerlessElasticsearchApiVersionMustBeAuto.into());
-            }
             // Amazon OpenSearch Serverless does not support the cluster-version API; hardcode
             // well-known API version
             8
@@ -226,20 +199,6 @@ impl ElasticsearchCommon {
         })
     }
 
-    fn check_endpoint(endpoint: &str) -> crate::Result<()> {
-        let uri = format!("{endpoint}/_test");
-        let uri = uri
-            .parse::<Uri>()
-            .with_context(|_| InvalidHostSnafu { host: endpoint })?;
-        if uri.host().is_none() {
-            return Err(ParseError::HostMustIncludeHostname {
-                host: endpoint.to_string(),
-            }
-            .into());
-        }
-        Ok(())
-    }
-
     // extract the authentication from config or endpoint
     async fn extract_auth(
         config: &ElasticsearchConfig,
@@ -248,13 +207,10 @@ impl ElasticsearchCommon {
     ) -> crate::Result<Option<Auth>> {
         let auth = match &config.auth {
             Some(ElasticsearchAuthConfig::Basic { user, password }) => {
-                let auth = Some(crate::http::Auth::Basic {
+                Some(Auth::Basic(crate::http::Auth::Basic {
                     user: user.clone(),
                     password: password.clone(),
-                });
-                // get whichever auth is provided between config and uri, prevent duplicate auth.
-                let auth = auth.choose_one(&uri.auth)?.unwrap();
-                Some(Auth::Basic(auth))
+                }))
             }
             #[cfg(feature = "aws-core")]
             Some(ElasticsearchAuthConfig::Aws(aws)) => {
@@ -262,8 +218,8 @@ impl ElasticsearchCommon {
                     .aws
                     .as_ref()
                     .map(|config| config.region())
-                    .ok_or(ParseError::RegionRequired)?
-                    .ok_or(ParseError::RegionRequired)?;
+                    .ok_or(super::ParseError::RegionRequired)?
+                    .ok_or(super::ParseError::RegionRequired)?;
                 Some(Auth::Aws {
                     credentials_provider: aws
                         .credentials_provider(region.clone(), proxy_config, config.tls.as_ref())
@@ -290,37 +246,42 @@ impl ElasticsearchCommon {
     /// Parses endpoints into a vector of ElasticsearchCommons. The resulting vector is guaranteed to not be empty.
     pub async fn parse_many(
         config: &ElasticsearchConfig,
+        validated: &ValidatedElasticsearch,
         proxy_config: &ProxyConfig,
     ) -> crate::Result<Vec<Self>> {
         let mut version = None;
-        if let Some(endpoint) = config.endpoint.as_ref() {
+        if config.endpoint.is_some() {
             warn!(
                 message = "DEPRECATION, use of deprecated option `endpoint`. Please use `endpoints` option instead."
             );
-            if config.endpoints.is_empty() {
-                Ok(vec![
-                    Self::parse_config(config, endpoint, proxy_config, &mut version).await?,
-                ])
-            } else {
-                Err(ParseError::EndpointsExclusive.into())
-            }
-        } else if config.endpoints.is_empty() {
-            Err(ParseError::EndpointRequired.into())
-        } else {
-            let mut commons = Vec::new();
-            for endpoint in config.endpoints.iter() {
-                commons
-                    .push(Self::parse_config(config, endpoint, proxy_config, &mut version).await?);
-            }
-            Ok(commons)
         }
+
+        let mut commons = Vec::new();
+        for endpoint in validated.endpoints() {
+            commons.push(
+                Self::parse_config(
+                    config,
+                    endpoint,
+                    validated.mode(),
+                    proxy_config,
+                    &mut version,
+                )
+                .await?,
+            );
+        }
+        Ok(commons)
     }
 
     /// Parses a single endpoint, else panics.
     #[cfg(test)]
     pub async fn parse_single(config: &ElasticsearchConfig) -> crate::Result<Self> {
-        let mut commons =
-            Self::parse_many(config, crate::config::SinkContext::default().proxy()).await?;
+        let validated = config.validate().map_err(|errors| errors.join("; "))?;
+        let mut commons = Self::parse_many(
+            config,
+            &validated,
+            crate::config::SinkContext::default().proxy(),
+        )
+        .await?;
         assert_eq!(commons.len(), 1);
         Ok(commons.remove(0))
     }

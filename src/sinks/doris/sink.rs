@@ -1,5 +1,5 @@
 use crate::sinks::{
-    doris::{DorisConfig, common::DorisCommon, request_builder::DorisRequestBuilder},
+    doris::{common::DorisCommon, request_builder::DorisRequestBuilder},
     prelude::*,
     util::http::HttpRequest,
 };
@@ -19,25 +19,20 @@ where
     S::Response: DriverResponse + Send + 'static,
     S::Error: std::fmt::Debug + Into<crate::Error> + Send,
 {
-    pub fn new(service: S, config: &DorisConfig, common: &DorisCommon) -> crate::Result<Self> {
-        let batch_settings = config.batch.into_batcher_settings()?;
-        let database =
-            config
-                .database
-                .clone()
-                .confine(&config.confinement, DorisConfig::NAME, "database")?;
-        let table =
-            config
-                .table
-                .clone()
-                .confine(&config.confinement, DorisConfig::NAME, "table")?;
-        Ok(DorisSink {
+    pub fn new(
+        service: S,
+        common: &DorisCommon,
+        batch_settings: BatcherSettings,
+        database: ConfinedTemplate,
+        table: ConfinedTemplate,
+    ) -> Self {
+        DorisSink {
             batch_settings,
             service,
             request_builder: common.request_builder.clone(),
             database,
             table,
-        })
+        }
     }
 
     async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {

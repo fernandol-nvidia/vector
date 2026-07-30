@@ -4,7 +4,10 @@ use aws_sdk_cloudwatchlogs::Client as CloudwatchLogsClient;
 use futures::FutureExt;
 use serde::{Deserialize, Deserializer, de};
 use tower::ServiceBuilder;
-use vector_lib::{codecs::JsonSerializerConfig, configurable::configurable_component, schema};
+use vector_lib::{
+    codecs::JsonSerializerConfig, configurable::configurable_component, schema,
+    stream::BatcherSettings,
+};
 use vrl::value::Kind;
 
 use crate::{
@@ -12,7 +15,7 @@ use crate::{
     codecs::{Encoder, EncodingConfig},
     config::{
         AcknowledgementsConfig, DataType, GenerateConfig, Input, ProxyConfig, SinkConfig,
-        SinkContext,
+        SinkContext, ValidateSink,
     },
     sinks::{
         Healthcheck, VectorSink,
@@ -24,7 +27,7 @@ use crate::{
             BatchConfig, Compression, ServiceBuilderExt, SinkBatchSettings, http::RequestConfig,
         },
     },
-    template::{ConfinementConfig, Template},
+    template::{ConfinedTemplate, ConfinementConfig, Template},
     tls::TlsConfig,
 };
 
@@ -203,20 +206,75 @@ impl CloudwatchLogsSinkConfig {
     }
 }
 
+/// Values derived while validating [`CloudwatchLogsSinkConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain the confined templates and batcher settings
+/// the sink uses is [`ValidateSink::validate`].
+#[derive(Debug)]
+pub struct ValidatedCloudwatchLogsSink {
+    group_template: ConfinedTemplate,
+    stream_template: ConfinedTemplate,
+    batcher_settings: BatcherSettings,
+}
+
+impl ValidateSink for CloudwatchLogsSinkConfig {
+    type Validated = ValidatedCloudwatchLogsSink;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        let mut errors = Vec::new();
+
+        let batcher_settings = self
+            .batch
+            .into_batcher_settings()
+            .inspect_err(|e| errors.push(format!("batch: {e}")))
+            .ok();
+
+        // Validate encoding configuration (structural checks only, no I/O)
+        if let Err(e) = self.encoding.validate_structure() {
+            errors.push(format!("encoding: {e}"));
+        }
+
+        let group_template = self
+            .group_name
+            .clone()
+            .confine(&self.confinement, Self::NAME, "group_name")
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
+        let stream_template = self
+            .stream_name
+            .clone()
+            .confine(&self.confinement, Self::NAME, "stream_name")
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
+        match (
+            errors.is_empty(),
+            group_template,
+            stream_template,
+            batcher_settings,
+        ) {
+            (true, Some(group_template), Some(stream_template), Some(batcher_settings)) => {
+                Ok(ValidatedCloudwatchLogsSink {
+                    group_template,
+                    stream_template,
+                    batcher_settings,
+                })
+            }
+            _ => Err(errors),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 #[typetag::serde(name = "aws_cloudwatch_logs")]
 impl SinkConfig for CloudwatchLogsSinkConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let group_template =
-            self.group_name
-                .clone()
-                .confine(&self.confinement, Self::NAME, "group_name")?;
-        let stream_template =
-            self.stream_name
-                .clone()
-                .confine(&self.confinement, Self::NAME, "stream_name")?;
-
-        let batcher_settings = self.batch.into_batcher_settings()?;
+        let ValidatedCloudwatchLogsSink {
+            group_template,
+            stream_template,
+            batcher_settings,
+        } = self.validate().map_err(|errors| errors.join("; "))?;
         let request_settings = self.request.tower.into_settings();
         let client = self.create_client(cx.proxy()).await?;
         let svc = ServiceBuilder::new()
@@ -260,39 +318,7 @@ impl SinkConfig for CloudwatchLogsSinkConfig {
     }
 
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        // Validate batch settings
-        if let Err(e) = self.batch.validate() {
-            errors.push(format!("batch: {e}"));
-        }
-
-        // Validate encoding configuration (structural checks only, no I/O)
-        if let Err(e) = self.encoding.validate_structure() {
-            errors.push(format!("encoding: {e}"));
-        }
-
-        if let Err(e) = self
-            .group_name
-            .clone()
-            .confine(&self.confinement, Self::NAME, "group_name")
-        {
-            errors.push(e.to_string());
-        }
-
-        if let Err(e) =
-            self.stream_name
-                .clone()
-                .confine(&self.confinement, Self::NAME, "stream_name")
-        {
-            errors.push(e.to_string());
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
+        self.validate().map(|_| ())
     }
 }
 
@@ -335,8 +361,14 @@ impl SinkBatchSettings for CloudwatchLogsDefaultBatchSettings {
 
 #[cfg(test)]
 mod tests {
-    use crate::sinks::aws_cloudwatch_logs::config::CloudwatchLogsSinkConfig;
-    use crate::template::{ConfinementConfig, Template};
+    use crate::{
+        config::ValidateSink,
+        event::Event,
+        sinks::aws_cloudwatch_logs::config::CloudwatchLogsSinkConfig,
+        template::{ConfinementConfig, Template},
+    };
+    use vector_lib::{codecs::JsonSerializerConfig, event::LogEvent};
+    use vrl::event_path;
 
     #[test]
     fn test_generate_config() {
@@ -370,10 +402,42 @@ mod tests {
     }
 
     #[test]
+    fn validate_yields_confined_templates_and_batcher_settings() {
+        use crate::sinks::util::batch::BatchConfig;
+
+        let mut batch = BatchConfig::default();
+        batch.max_bytes = Some(1024);
+        batch.max_events = Some(10);
+
+        let config = super::CloudwatchLogsSinkConfig {
+            group_name: Template::try_from("group-{{ env }}").unwrap(),
+            stream_name: Template::try_from("stream-{{ env }}").unwrap(),
+            batch,
+            ..super::default_config(JsonSerializerConfig::default().into())
+        };
+
+        let validated = config.validate().expect("config is valid");
+
+        let mut event = LogEvent::from_str_legacy("message");
+        event.insert(event_path!("env"), "prod");
+        let event = Event::from(event);
+
+        assert_eq!(
+            validated.group_template.render_string(&event).unwrap(),
+            "group-prod"
+        );
+        assert_eq!(
+            validated.stream_template.render_string(&event).unwrap(),
+            "stream-prod"
+        );
+        assert_eq!(validated.batcher_settings.size_limit, 1024);
+        assert_eq!(validated.batcher_settings.item_limit, 10);
+    }
+
+    #[test]
     fn validate_structure_rejects_invalid_batch_settings() {
         use crate::config::SinkConfig;
         use crate::sinks::util::batch::BatchConfig;
-        use vector_lib::codecs::JsonSerializerConfig;
 
         let mut batch = BatchConfig::default();
         batch.max_events = Some(0);

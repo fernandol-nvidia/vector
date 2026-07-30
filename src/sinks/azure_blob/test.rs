@@ -18,6 +18,7 @@ use crate::{
     sinks::prelude::*,
     sinks::util::{
         Compression,
+        partitioner::KeyPartitioner,
         request_builder::{EncodeResult, RequestBuilder},
     },
 };
@@ -42,6 +43,15 @@ fn default_config(encoding: EncodingConfigWithFraming) -> AzureBlobSinkConfig {
     }
 }
 
+fn key_partitioner(sink_config: &AzureBlobSinkConfig) -> KeyPartitioner {
+    let blob_prefix = sink_config
+        .blob_prefix
+        .clone()
+        .confine(&sink_config.confinement, "azure_blob", "blob_prefix")
+        .unwrap();
+    sink_config.key_partitioner(blob_prefix)
+}
+
 #[test]
 fn generate_config() {
     crate::test_util::test_generate_config::<AzureBlobSinkConfig>();
@@ -60,9 +70,7 @@ fn azure_blob_build_request_without_compression() {
     let blob_time_format = String::from("");
     let blob_append_uuid = false;
 
-    let key = sink_config
-        .key_partitioner()
-        .unwrap()
+    let key = key_partitioner(&sink_config)
         .partition(&log)
         .expect("key wasn't provided");
 
@@ -108,9 +116,7 @@ fn azure_blob_build_request_with_compression() {
     let blob_time_format = String::from("");
     let blob_append_uuid = false;
 
-    let key = sink_config
-        .key_partitioner()
-        .unwrap()
+    let key = key_partitioner(&sink_config)
         .partition(&log)
         .expect("key wasn't provided");
 
@@ -156,9 +162,7 @@ fn azure_blob_build_request_with_time_format() {
     let blob_time_format = String::from("%F");
     let blob_append_uuid = false;
 
-    let key = sink_config
-        .key_partitioner()
-        .unwrap()
+    let key = key_partitioner(&sink_config)
         .partition(&log)
         .expect("key wasn't provided");
 
@@ -207,9 +211,7 @@ fn azure_blob_build_request_with_uuid() {
     let blob_time_format = String::from("");
     let blob_append_uuid = true;
 
-    let key = sink_config
-        .key_partitioner()
-        .unwrap()
+    let key = key_partitioner(&sink_config)
         .partition(&log)
         .expect("key wasn't provided");
 

@@ -390,45 +390,22 @@ impl GenerateConfig for PulsarSinkConfig {
     }
 }
 
-#[async_trait::async_trait]
-#[typetag::serde(name = "pulsar")]
-impl SinkConfig for PulsarSinkConfig {
-    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let topic = self
-            .topic
-            .clone()
-            .confine(&self.confinement, Self::NAME, "topic")?;
+/// Values derived while validating [`PulsarSinkConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain the confined topic template the sink renders
+/// with is [`ValidateSink::validate`].
+#[derive(Debug)]
+pub struct ValidatedPulsarSink {
+    topic: ConfinedTemplate,
+}
 
-        let client = self
-            .create_pulsar_client()
-            .await
-            .map_err(|e| super::sink::BuildError::CreatePulsarSink { source: e })?;
+impl ValidateSink for PulsarSinkConfig {
+    type Validated = ValidatedPulsarSink;
 
-        let sink = PulsarSink::new(client, self.clone(), topic.clone())?;
-        let hc = healthcheck(self.clone(), topic).boxed();
-        Ok((VectorSink::from_event_streamsink(sink), hc))
-    }
-
-    fn confinement_config(&self) -> Option<&crate::template::ConfinementConfig> {
-        Some(&self.confinement)
-    }
-
-    fn input(&self) -> Input {
-        let requirement =
-            schema::Requirement::empty().optional_meaning("timestamp", Kind::timestamp());
-
-        Input::new(self.encoding.config().input_type() & (DataType::Log | DataType::Metric))
-            .with_schema_requirement(requirement)
-    }
-
-    fn acknowledgements(&self) -> &AcknowledgementsConfig {
-        &self.acknowledgements
-    }
-
-    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
         let mut errors = Vec::new();
 
-        // Validate auth configuration shape (mirrors create_pulsar_client)
+        // Validate auth configuration shape.
         if let Some(auth) = &self.auth {
             match (
                 auth.name.as_ref(),
@@ -456,24 +433,59 @@ impl SinkConfig for PulsarSinkConfig {
             }
         }
 
-        if let Err(e) = self
+        let topic = self
             .topic
             .clone()
             .confine(&self.confinement, Self::NAME, "topic")
-        {
-            errors.push(e.to_string());
-        }
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
 
         // Validate encoding configuration (structural checks only, no I/O)
         if let Err(e) = self.encoding.validate_structure() {
             errors.push(format!("encoding: {e}"));
         }
 
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
+        match (errors.is_empty(), topic) {
+            (true, Some(topic)) => Ok(ValidatedPulsarSink { topic }),
+            _ => Err(errors),
         }
+    }
+}
+
+#[async_trait::async_trait]
+#[typetag::serde(name = "pulsar")]
+impl SinkConfig for PulsarSinkConfig {
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        self.validate().map(|_| ())
+    }
+
+    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        let ValidatedPulsarSink { topic } = self.validate().map_err(|errors| errors.join("; "))?;
+
+        let client = self
+            .create_pulsar_client()
+            .await
+            .map_err(|e| super::sink::BuildError::CreatePulsarSink { source: e })?;
+
+        let sink = PulsarSink::new(client, self.clone(), topic.clone())?;
+        let hc = healthcheck(self.clone(), topic).boxed();
+        Ok((VectorSink::from_event_streamsink(sink), hc))
+    }
+
+    fn confinement_config(&self) -> Option<&crate::template::ConfinementConfig> {
+        Some(&self.confinement)
+    }
+
+    fn input(&self) -> Input {
+        let requirement =
+            schema::Requirement::empty().optional_meaning("timestamp", Kind::timestamp());
+
+        Input::new(self.encoding.config().input_type() & (DataType::Log | DataType::Metric))
+            .with_schema_requirement(requirement)
+    }
+
+    fn acknowledgements(&self) -> &AcknowledgementsConfig {
+        &self.acknowledgements
     }
 }
 
@@ -505,6 +517,29 @@ mod tests {
         let config = ConfinementConfig::default();
         let result = template.confine(&config, "pulsar", "topic");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_yields_confined_topic() {
+        use crate::config::ValidateSink;
+        use crate::event::{Event, LogEvent};
+        use vrl::event_path;
+
+        let config = super::PulsarSinkConfig {
+            topic: Template::try_from("events-{{ env }}").unwrap(),
+            ..super::PulsarSinkConfig::default()
+        };
+
+        let validated = config.validate().expect("config is valid");
+
+        let mut event = LogEvent::from_str_legacy("message");
+        event.insert(event_path!("env"), "prod");
+        let event = Event::from(event);
+
+        assert_eq!(
+            validated.topic.render_string(&event).unwrap(),
+            "events-prod"
+        );
     }
 
     #[test]

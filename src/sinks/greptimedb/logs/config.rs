@@ -133,27 +133,119 @@ pub struct GreptimeDBLogsConfig {
 
 impl_generate_config_from_default!(GreptimeDBLogsConfig);
 
-#[async_trait::async_trait]
-#[typetag::serde(name = "greptimedb_logs")]
-impl SinkConfig for GreptimeDBLogsConfig {
-    async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let confined_table = self
+/// Values derived while validating [`GreptimeDBLogsConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain the confined templates and batcher settings
+/// the sink uses is [`ValidateSink::validate`].
+#[derive(Debug)]
+pub struct ValidatedGreptimeDBLogs {
+    table: ConfinedTemplate,
+    dbname: ConfinedTemplate,
+    pipeline_name: ConfinedTemplate,
+    pipeline_version: Option<ConfinedTemplate>,
+    batcher_settings: BatcherSettings,
+}
+
+impl ValidateSink for GreptimeDBLogsConfig {
+    type Validated = ValidatedGreptimeDBLogs;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        let mut errors = Vec::new();
+
+        if let Err(e) = url::Url::parse(&self.endpoint) {
+            errors.push(format!("endpoint: invalid URL: {e}"));
+        }
+
+        let table = self
             .table
             .clone()
-            .confine(&self.confinement, Self::NAME, "table")?;
-        let confined_dbname =
-            self.dbname
-                .clone()
-                .confine(&self.confinement, Self::NAME, "dbname")?;
-        let confined_pipeline_name =
-            self.pipeline_name
-                .clone()
-                .confine(&self.confinement, Self::NAME, "pipeline_name")?;
-        let confined_pipeline_version = self
+            .confine(&self.confinement, Self::NAME, "table")
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
+        let dbname = self
+            .dbname
+            .clone()
+            .confine(&self.confinement, Self::NAME, "dbname")
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
+        let pipeline_name = self
+            .pipeline_name
+            .clone()
+            .confine(&self.confinement, Self::NAME, "pipeline_name")
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
+        let pipeline_version = self
             .pipeline_version
             .clone()
             .map(|t| t.confine(&self.confinement, Self::NAME, "pipeline_version"))
-            .transpose()?;
+            .transpose()
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
+        let batcher_settings = self
+            .batch
+            .into_batcher_settings()
+            .inspect_err(|e| errors.push(format!("batch: {e}")))
+            .ok();
+
+        if let Some(headers) = &self.extra_headers {
+            use http::header::{HeaderName, HeaderValue};
+            for (name, value) in headers {
+                if let Err(e) = HeaderName::from_bytes(name.as_bytes()) {
+                    errors.push(format!("extra_headers.{name}: invalid header name: {e}"));
+                }
+                if let Err(e) = HeaderValue::from_str(value) {
+                    errors.push(format!("extra_headers.{name}: invalid header value: {e}"));
+                }
+            }
+        }
+
+        match (
+            errors.is_empty(),
+            table,
+            dbname,
+            pipeline_name,
+            pipeline_version,
+            batcher_settings,
+        ) {
+            (
+                true,
+                Some(table),
+                Some(dbname),
+                Some(pipeline_name),
+                Some(pipeline_version),
+                Some(batcher_settings),
+            ) => Ok(ValidatedGreptimeDBLogs {
+                table,
+                dbname,
+                pipeline_name,
+                pipeline_version,
+                batcher_settings,
+            }),
+            _ => Err(errors),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+#[typetag::serde(name = "greptimedb_logs")]
+impl SinkConfig for GreptimeDBLogsConfig {
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        self.validate().map(|_| ())
+    }
+
+    async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        let ValidatedGreptimeDBLogs {
+            table,
+            dbname,
+            pipeline_name,
+            pipeline_version,
+            batcher_settings,
+        } = self.validate().map_err(|errors| errors.join("; "))?;
+
         let tls_settings = TlsSettings::from_options(self.tls.as_ref())?;
         let client = HttpClient::new(tls_settings, &cx.proxy)?;
 
@@ -189,14 +281,14 @@ impl SinkConfig for GreptimeDBLogsConfig {
             .service(service);
 
         let logs_sink_setting = LogsSinkSetting {
-            dbname: confined_dbname,
-            table: confined_table,
-            pipeline_name: confined_pipeline_name,
-            pipeline_version: confined_pipeline_version,
+            dbname,
+            table,
+            pipeline_name,
+            pipeline_version,
         };
 
         let sink = GreptimeDBLogsHttpSink::new(
-            self.batch.into_batcher_settings()?,
+            batcher_settings,
             service,
             request_builder,
             logs_sink_setting,
@@ -221,77 +313,13 @@ impl SinkConfig for GreptimeDBLogsConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
-
-    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        // Parse endpoint URL to catch malformed endpoints early
-        // (mirrors url::Url::parse in prepare_log_ingester_url)
-        if let Err(e) = url::Url::parse(&self.endpoint) {
-            errors.push(format!("endpoint: invalid URL: {e}"));
-        }
-
-        if let Err(e) = self
-            .table
-            .clone()
-            .confine(&self.confinement, Self::NAME, "table")
-        {
-            errors.push(e.to_string());
-        }
-
-        if let Err(e) = self
-            .dbname
-            .clone()
-            .confine(&self.confinement, Self::NAME, "dbname")
-        {
-            errors.push(e.to_string());
-        }
-
-        if let Err(e) =
-            self.pipeline_name
-                .clone()
-                .confine(&self.confinement, Self::NAME, "pipeline_name")
-        {
-            errors.push(e.to_string());
-        }
-
-        if let Some(pipeline_version) = self.pipeline_version.clone()
-            && let Err(e) =
-                pipeline_version.confine(&self.confinement, Self::NAME, "pipeline_version")
-        {
-            errors.push(e.to_string());
-        }
-
-        // Validate batch settings (mirrors self.batch.into_batcher_settings()? in build())
-        if let Err(e) = self.batch.validate() {
-            errors.push(format!("batch: {e}"));
-        }
-
-        // Validate extra_headers header names and values
-        if let Some(headers) = &self.extra_headers {
-            use http::header::{HeaderName, HeaderValue};
-            for (name, value) in headers {
-                if let Err(e) = HeaderName::from_bytes(name.as_bytes()) {
-                    errors.push(format!("extra_headers.{name}: invalid header name: {e}"));
-                }
-                if let Err(e) = HeaderValue::from_str(value) {
-                    errors.push(format!("extra_headers.{name}: invalid header value: {e}"));
-                }
-            }
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::template::{ConfinementConfig, Template};
+    use vrl::event_path;
 
     #[test]
     fn confinement_rejects_unconfined_table() {
@@ -367,6 +395,44 @@ mod tests {
         };
 
         config.validate_structure().unwrap();
+    }
+
+    #[test]
+    fn validate_yields_confined_templates_and_batcher_settings() {
+        let config = GreptimeDBLogsConfig {
+            endpoint: "http://localhost:4000".to_string(),
+            table: Template::try_from("events-{{ env }}").unwrap(),
+            dbname: Template::try_from("db-{{ env }}").unwrap(),
+            pipeline_name: Template::try_from("pipeline-{{ env }}").unwrap(),
+            pipeline_version: Some(Template::try_from("version-{{ env }}").unwrap()),
+            ..GreptimeDBLogsConfig::default()
+        };
+
+        let validated = config.validate().expect("config is valid");
+
+        let mut event = LogEvent::from_str_legacy("message");
+        event.insert(event_path!("env"), "prod");
+        let event = Event::from(event);
+
+        assert_eq!(
+            validated.table.render_string(&event).unwrap(),
+            "events-prod"
+        );
+        assert_eq!(validated.dbname.render_string(&event).unwrap(), "db-prod");
+        assert_eq!(
+            validated.pipeline_name.render_string(&event).unwrap(),
+            "pipeline-prod"
+        );
+        assert_eq!(
+            validated
+                .pipeline_version
+                .as_ref()
+                .unwrap()
+                .render_string(&event)
+                .unwrap(),
+            "version-prod"
+        );
+        assert_eq!(validated.batcher_settings.item_limit, 20);
     }
 
     #[test]

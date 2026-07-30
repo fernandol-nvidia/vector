@@ -12,13 +12,17 @@ use vector_lib::{
     },
     configurable::configurable_component,
     sink::VectorSink,
+    stream::BatcherSettings,
 };
 
 use super::sink::S3RequestOptions;
 use crate::{
     aws::{AwsAuthentication, RegionOrEndpoint},
     codecs::{Encoder, EncodingConfigWithFraming, SinkType},
-    config::{AcknowledgementsConfig, GenerateConfig, Input, ProxyConfig, SinkConfig, SinkContext},
+    config::{
+        AcknowledgementsConfig, GenerateConfig, Input, ProxyConfig, SinkConfig, SinkContext,
+        ValidateSink,
+    },
     sinks::{
         Healthcheck,
         s3_common::{
@@ -33,7 +37,7 @@ use crate::{
             TowerRequestConfig, timezone_to_offset,
         },
     },
-    template::{ConfinementConfig, Template},
+    template::{ConfinedTemplate, ConfinementConfig, Template},
     tls::TlsConfig,
 };
 
@@ -225,13 +229,88 @@ impl GenerateConfig for S3SinkConfig {
     }
 }
 
+/// Values derived while validating [`S3SinkConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain the confined templates and batch settings
+/// the sink uses is [`ValidateSink::validate`].
+#[derive(Debug)]
+pub struct ValidatedAwsS3 {
+    key_prefix: ConfinedTemplate,
+    ssekms_key_id: Option<ConfinedTemplate>,
+    batch_settings: BatcherSettings,
+}
+
+impl ValidateSink for S3SinkConfig {
+    type Validated = ValidatedAwsS3;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        let mut errors = Vec::new();
+
+        let key_prefix = Template::try_from(self.key_prefix.clone())
+            .map_err(|e| format!("key_prefix: {e}"))
+            .and_then(|tpl| {
+                tpl.confine(&self.confinement, Self::NAME, "key_prefix")
+                    .map_err(|e| e.to_string())
+            })
+            .inspect_err(|e| errors.push(e.clone()))
+            .ok();
+
+        let ssekms_key_id = self
+            .options
+            .ssekms_key_id
+            .as_ref()
+            .map(|ssekms_key_id| {
+                Template::try_from(ssekms_key_id.as_str())
+                    .map_err(|e| format!("ssekms_key_id: {e}"))
+                    .and_then(|tpl| {
+                        tpl.confine(&self.confinement, Self::NAME, "ssekms_key_id")
+                            .map_err(|e| e.to_string())
+                    })
+            })
+            .transpose()
+            .inspect_err(|e| errors.push(e.clone()))
+            .ok();
+
+        let batch_settings = self
+            .batch
+            .into_batcher_settings()
+            .inspect_err(|e| errors.push(format!("batch: {e}")))
+            .ok();
+
+        #[cfg(feature = "codecs-parquet")]
+        if self.batch_encoding.is_none()
+            && let Err(e) = self.encoding.validate_structure()
+        {
+            errors.push(format!("encoding: {e}"));
+        }
+
+        #[cfg(not(feature = "codecs-parquet"))]
+        if let Err(e) = self.encoding.validate_structure() {
+            errors.push(format!("encoding: {e}"));
+        }
+
+        match (errors.is_empty(), key_prefix, ssekms_key_id, batch_settings) {
+            (true, Some(key_prefix), Some(ssekms_key_id), Some(batch_settings)) => {
+                Ok(ValidatedAwsS3 {
+                    key_prefix,
+                    ssekms_key_id,
+                    batch_settings,
+                })
+            }
+            _ => Err(errors),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 #[typetag::serde(name = "aws_s3")]
 impl SinkConfig for S3SinkConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        let validated = self.validate().map_err(|errors| errors.join("; "))?;
+
         let service = self.create_service(&cx.proxy).await?;
         let healthcheck = self.build_healthcheck(service.client())?;
-        let sink = self.build_processor(service, cx)?;
+        let sink = self.build_processor(service, cx, validated)?;
         Ok((sink, healthcheck))
     }
 
@@ -254,66 +333,7 @@ impl SinkConfig for S3SinkConfig {
     }
 
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        // Validate template confinement for key_prefix.
-        // This is a purely structural check that does not require environment access.
-        match Template::try_from(self.key_prefix.clone()) {
-            Ok(tpl) => {
-                if let Err(e) = tpl.confine(&self.confinement, Self::NAME, "key_prefix") {
-                    errors.push(e.to_string());
-                }
-            }
-            Err(e) => {
-                errors.push(format!("key_prefix: {e}"));
-            }
-        }
-
-        // Validate template confinement for ssekms_key_id if present.
-        if let Some(ssekms_key_id) = &self.options.ssekms_key_id {
-            match Template::try_from(ssekms_key_id.as_str()) {
-                Ok(tpl) => {
-                    if let Err(e) = tpl.confine(&self.confinement, Self::NAME, "ssekms_key_id") {
-                        errors.push(e.to_string());
-                    }
-                }
-                Err(e) => {
-                    errors.push(format!("ssekms_key_id: {e}"));
-                }
-            }
-        }
-
-        // Validate batch settings.
-        if let Err(e) = self.batch.validate() {
-            errors.push(format!("batch: {e}"));
-        }
-
-        // Validate encoding configuration:
-        // - When batch_encoding is set (e.g., Parquet), validate the batch serializer
-        // - Otherwise validate the normal encoding
-        #[cfg(feature = "codecs-parquet")]
-        if let Some(batch_encoding) = &self.batch_encoding {
-            let S3BatchEncoding::Parquet(parquet_config) = batch_encoding;
-            let resolved_batch_config = BatchSerializerConfig::Parquet(parquet_config.clone());
-            if let Err(e) = resolved_batch_config.build_batch_serializer() {
-                errors.push(format!("batch_encoding: {e}"));
-            }
-        } else {
-            if let Err(e) = self.encoding.validate_structure() {
-                errors.push(format!("encoding: {e}"));
-            }
-        }
-
-        #[cfg(not(feature = "codecs-parquet"))]
-        if let Err(e) = self.encoding.validate_structure() {
-            errors.push(format!("encoding: {e}"));
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
+        self.validate().map(|_| ())
     }
 }
 
@@ -322,7 +342,14 @@ impl S3SinkConfig {
         &self,
         service: S3Service,
         cx: SinkContext,
+        validated: <Self as ValidateSink>::Validated,
     ) -> crate::Result<VectorSink> {
+        let ValidatedAwsS3 {
+            key_prefix,
+            ssekms_key_id,
+            batch_settings,
+        } = validated;
+
         // Build our S3 client/service, which is what we'll ultimately feed
         // requests into in order to ship files to S3.  We build this here in
         // order to configure the client/service with retries, concurrency
@@ -338,22 +365,7 @@ impl S3SinkConfig {
             .or(cx.globals.timezone)
             .and_then(timezone_to_offset);
 
-        // Configure our partitioning/batching.
-        let batch_settings = self.batch.into_batcher_settings()?;
-
-        let key_prefix = Template::try_from(self.key_prefix.clone())?.with_tz_offset(offset);
-        let key_prefix = key_prefix.confine(&self.confinement, Self::NAME, "key_prefix")?;
-
-        let ssekms_key_id = self
-            .options
-            .ssekms_key_id
-            .as_ref()
-            .cloned()
-            .map(|ssekms_key_id| Template::try_from(ssekms_key_id.as_str()))
-            .transpose()?
-            .map(|t| t.confine(&self.confinement, Self::NAME, "ssekms_key_id"))
-            .transpose()?;
-
+        let key_prefix = key_prefix.with_tz_offset(offset);
         let partitioner = S3KeyPartitioner::new(key_prefix, ssekms_key_id, None);
 
         let transformer = self.encoding.transformer();
@@ -444,11 +456,46 @@ impl S3SinkConfig {
 #[cfg(test)]
 mod tests {
     use super::S3SinkConfig;
-    use crate::template::{ConfinementConfig, Template};
+    use crate::{
+        config::ValidateSink,
+        template::{ConfinementConfig, Template},
+    };
 
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<S3SinkConfig>();
+    }
+
+    #[test]
+    fn validate_yields_confined_templates() {
+        use crate::event::Event;
+        use vector_lib::event::LogEvent;
+        use vrl::event_path;
+
+        let config: S3SinkConfig = serde_yaml::from_str(indoc::indoc! {r#"
+            bucket: test-bucket
+            key_prefix: "logs/{{ tenant }}/"
+            ssekms_key_id: "kms/{{ key_id }}"
+            encoding:
+              codec: text
+            "#})
+        .unwrap();
+
+        let super::ValidatedAwsS3 {
+            key_prefix,
+            ssekms_key_id,
+            batch_settings: _,
+        } = config.validate().unwrap();
+
+        let mut event = Event::Log(LogEvent::from("x"));
+        event.as_mut_log().insert(event_path!("tenant"), "acme");
+        event.as_mut_log().insert(event_path!("key_id"), "primary");
+
+        assert_eq!(key_prefix.render_string(&event).unwrap(), "logs/acme/");
+        assert_eq!(
+            ssekms_key_id.unwrap().render_string(&event).unwrap(),
+            "kms/primary"
+        );
     }
 
     /// Correct TOML shape: `batch_encoding.codec = "parquet"` with `schema_mode = "auto_infer"`.

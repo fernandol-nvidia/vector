@@ -7,7 +7,6 @@ use http::{
     header::{HeaderName, HeaderValue},
 };
 use indoc::indoc;
-use snafu::{ResultExt, Snafu};
 use tower::ServiceBuilder;
 use uuid::Uuid;
 use vector_lib::{
@@ -16,14 +15,18 @@ use vector_lib::{
     configurable::configurable_component,
     event::{EventFinalizers, Finalizable},
     request_metadata::RequestMetadata,
+    stream::BatcherSettings,
 };
 
 use crate::{
     codecs::{Encoder, EncodingConfigWithFraming, SinkType, Transformer},
-    config::{AcknowledgementsConfig, DataType, GenerateConfig, Input, SinkConfig, SinkContext},
+    config::{
+        AcknowledgementsConfig, DataType, GenerateConfig, Input, SinkConfig, SinkContext,
+        ValidateSink,
+    },
     event::Event,
     gcp::{GcpAuthConfig, GcpAuthenticator, Scope},
-    http::{HttpClient, get_http_scheme_from_uri},
+    http::HttpClient,
     serde::json::to_string,
     sinks::{
         Healthcheck, VectorSink,
@@ -42,16 +45,9 @@ use crate::{
             service::TowerRequestConfigDefaults, timezone_to_offset,
         },
     },
-    template::{ConfinementConfig, Template, TemplateParseError},
+    template::{ConfinedTemplate, ConfinementConfig, Template},
     tls::{TlsConfig, TlsSettings},
 };
-
-#[derive(Debug, Snafu)]
-#[snafu(visibility(pub))]
-pub enum GcsHealthcheckError {
-    #[snafu(display("key_prefix template parse error: {}", source))]
-    KeyPrefixTemplate { source: TemplateParseError },
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct GcsTowerRequestConfigDefaults;
@@ -265,12 +261,154 @@ impl GenerateConfig for GcsSinkConfig {
     }
 }
 
+/// Values derived while validating [`GcsSinkConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain the confined key prefix, parsed endpoint
+/// protocol, request header values, and batcher settings the sink uses is
+/// [`ValidateSink::validate`].
+#[derive(Debug)]
+pub struct ValidatedGcsSink {
+    key_prefix: ConfinedTemplate,
+    batch_settings: BatcherSettings,
+    base_url: String,
+    protocol: &'static str,
+    content_type: Option<HeaderValue>,
+    content_encoding: Option<HeaderValue>,
+    cache_control: Option<HeaderValue>,
+    metadata_headers: Vec<(HeaderName, HeaderValue)>,
+}
+
+impl ValidateSink for GcsSinkConfig {
+    type Validated = ValidatedGcsSink;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        let mut errors = Vec::new();
+
+        let key_prefix = Template::try_from(self.key_prefix.as_deref().unwrap_or("date=%F/"))
+            .map_err(|e| format!("key_prefix: {e}"))
+            .and_then(|tpl| {
+                tpl.confine(&self.confinement, Self::NAME, "key_prefix")
+                    .map_err(|e| e.to_string())
+            })
+            .inspect_err(|e| errors.push(e.clone()))
+            .ok();
+
+        let content_type = self
+            .content_type
+            .as_deref()
+            .map(HeaderValue::from_str)
+            .transpose()
+            .inspect_err(|e| errors.push(format!("content_type: invalid header value: {e}")))
+            .ok()
+            .flatten();
+
+        let content_encoding = match &self.content_encoding {
+            Some(content_encoding) => HeaderValue::from_str(content_encoding)
+                .map(Some)
+                .inspect_err(|e| {
+                    errors.push(format!("content_encoding: invalid header value: {e}"));
+                })
+                .ok()
+                .flatten(),
+            None => self
+                .compression
+                .content_encoding()
+                .map(|content_encoding| HeaderValue::from_str(&to_string(content_encoding)))
+                .transpose()
+                .inspect_err(|e| {
+                    errors.push(format!("content_encoding: invalid header value: {e}"));
+                })
+                .ok()
+                .flatten(),
+        };
+
+        let cache_control = self
+            .cache_control
+            .as_deref()
+            .map(HeaderValue::from_str)
+            .transpose()
+            .inspect_err(|e| errors.push(format!("cache_control: invalid header value: {e}")))
+            .ok()
+            .flatten();
+
+        let mut metadata_headers = Vec::new();
+        if let Some(metadata) = &self.metadata {
+            for (name, value) in metadata {
+                let header_value = HeaderValue::from_str(value)
+                    .inspect_err(|e| {
+                        errors.push(format!("metadata.{name}: invalid header value: {e}"));
+                    })
+                    .ok();
+                let header_name = HeaderName::from_bytes(name.as_bytes())
+                    .inspect_err(|e| {
+                        errors.push(format!("metadata.{name}: invalid header name: {e}"));
+                    })
+                    .ok();
+
+                if let (Some(header_name), Some(header_value)) = (header_name, header_value) {
+                    metadata_headers.push((header_name, header_value));
+                }
+            }
+        }
+
+        let base_url = format!("{}/{}/", self.endpoint, self.bucket);
+        let protocol = base_url
+            .parse::<Uri>()
+            .map_err(|e| format!("endpoint: invalid URL after combining with bucket: {e}"))
+            .and_then(|uri| {
+                let scheme = uri.scheme().map(|s| s.as_str()).unwrap_or("");
+                match scheme {
+                    "http" => Ok("http"),
+                    "https" => Ok("https"),
+                    _ => Err(format!(
+                        "endpoint: scheme must be 'http' or 'https', got '{}'",
+                        scheme
+                    )),
+                }
+            })
+            .inspect_err(|e| errors.push(e.clone()))
+            .ok();
+
+        if let Err(e) = self.encoding.validate_structure() {
+            errors.push(format!("encoding: {e}"));
+        }
+
+        let batch_settings = self
+            .batch
+            .into_batcher_settings()
+            .inspect_err(|e| errors.push(format!("batch: {e}")))
+            .ok();
+
+        match (errors.is_empty(), key_prefix, protocol, batch_settings) {
+            (true, Some(key_prefix), Some(protocol), Some(batch_settings)) => {
+                Ok(ValidatedGcsSink {
+                    key_prefix,
+                    batch_settings,
+                    base_url,
+                    protocol,
+                    content_type,
+                    content_encoding,
+                    cache_control,
+                    metadata_headers,
+                })
+            }
+            _ => Err(errors),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 #[typetag::serde(name = "gcp_cloud_storage")]
 impl SinkConfig for GcsSinkConfig {
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        self.validate().map(|_| ())
+    }
+
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        let validated = self.validate().map_err(|errors| errors.join("; "))?;
+        let base_url = validated.base_url.clone();
+
         let auth = self.auth.build(Scope::DevStorageReadWrite).await?;
-        let base_url = format!("{}/{}/", self.endpoint, self.bucket);
         let tls = TlsSettings::from_options(self.tls.as_ref())?;
         let client = HttpClient::new(tls, cx.proxy())?;
         let healthcheck = build_healthcheck(
@@ -280,7 +418,7 @@ impl SinkConfig for GcsSinkConfig {
             auth.clone(),
         )?;
         auth.spawn_regenerate_token();
-        let sink = self.build_sink(client, base_url, auth, cx)?;
+        let sink = self.build_sink(client, auth, cx, validated)?;
         Ok((sink, healthcheck))
     }
 
@@ -295,125 +433,55 @@ impl SinkConfig for GcsSinkConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
-
-    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        use http::header::HeaderValue;
-
-        let mut errors = Vec::new();
-
-        match Template::try_from(self.key_prefix.as_deref().unwrap_or("date=%F/")) {
-            Ok(tpl) => {
-                if let Err(e) = tpl.confine(&self.confinement, Self::NAME, "key_prefix") {
-                    errors.push(e.to_string());
-                }
-            }
-            Err(e) => {
-                errors.push(format!("key_prefix: {e}"));
-            }
-        }
-
-        // Validate header values that RequestSettings::new() would reject
-        if let Some(content_type) = &self.content_type
-            && let Err(e) = HeaderValue::from_str(content_type)
-        {
-            errors.push(format!("content_type: invalid header value: {e}"));
-        }
-
-        if let Some(content_encoding) = &self.content_encoding
-            && let Err(e) = HeaderValue::from_str(content_encoding)
-        {
-            errors.push(format!("content_encoding: invalid header value: {e}"));
-        }
-
-        if let Some(cache_control) = &self.cache_control
-            && let Err(e) = HeaderValue::from_str(cache_control)
-        {
-            errors.push(format!("cache_control: invalid header value: {e}"));
-        }
-
-        if let Some(metadata) = &self.metadata {
-            for (name, value) in metadata {
-                if let Err(e) = HeaderValue::from_str(value) {
-                    errors.push(format!("metadata.{name}: invalid header value: {e}"));
-                }
-                // Validate metadata key as header name
-                if let Err(e) = HeaderName::from_bytes(name.as_bytes()) {
-                    errors.push(format!("metadata.{name}: invalid header name: {e}"));
-                }
-            }
-        }
-
-        // Validate endpoint URL parses correctly
-        // build_sink() calls base_url.parse::<Uri>().unwrap() after formatting
-        let base_url = format!("{}/{}/", self.endpoint, self.bucket);
-        match base_url.parse::<Uri>() {
-            Ok(uri) => {
-                // Validate scheme is http or https (get_http_scheme_from_uri panics otherwise)
-                let scheme = uri.scheme().map(|s| s.as_str()).unwrap_or("");
-                if scheme != "http" && scheme != "https" {
-                    errors.push(format!(
-                        "endpoint: scheme must be 'http' or 'https', got '{}'",
-                        scheme
-                    ));
-                }
-            }
-            Err(e) => {
-                errors.push(format!(
-                    "endpoint: invalid URL after combining with bucket: {e}"
-                ));
-            }
-        }
-
-        // Validate encoding configuration (structural checks only, no I/O)
-        if let Err(e) = self.encoding.validate_structure() {
-            errors.push(format!("encoding: {e}"));
-        }
-
-        // Validate batch settings
-        if let Err(e) = self.batch.validate() {
-            errors.push(format!("batch: {e}"));
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
-    }
 }
 
 impl GcsSinkConfig {
     fn build_sink(
         &self,
         client: HttpClient,
-        base_url: String,
         auth: GcpAuthenticator,
         cx: SinkContext,
+        validated: ValidatedGcsSink,
     ) -> crate::Result<VectorSink> {
+        let ValidatedGcsSink {
+            key_prefix,
+            batch_settings,
+            base_url,
+            protocol,
+            content_type,
+            content_encoding,
+            cache_control,
+            metadata_headers,
+        } = validated;
+
         let request = self.request.into_settings();
-
-        let batch_settings = self.batch.into_batcher_settings()?;
-
-        let partitioner = self.key_partitioner()?;
-
-        let protocol = get_http_scheme_from_uri(&base_url.parse::<Uri>().unwrap());
+        let partitioner = KeyPartitioner::new(key_prefix, None);
 
         let svc = ServiceBuilder::new()
             .settings(request, GcsRetryLogic::default())
             .service(GcsService::new(client, base_url, auth));
 
-        let request_settings = RequestSettings::new(self, cx)?;
+        let request_settings = RequestSettings::new(
+            self,
+            cx,
+            content_type,
+            content_encoding,
+            cache_control,
+            metadata_headers,
+        )?;
 
         let sink = GcsSink::new(svc, request_settings, partitioner, batch_settings, protocol);
 
         Ok(VectorSink::from_event_streamsink(sink))
     }
 
+    /// Test-only shortcut from raw config to a partitioner. `build_sink` builds its partitioner
+    /// from the already-validated key prefix instead, so this must not be used on the build path.
+    #[cfg(test)]
     fn key_partitioner(&self) -> crate::Result<KeyPartitioner> {
-        let tpl = Template::try_from(self.key_prefix.as_deref().unwrap_or("date=%F/"))
-            .context(KeyPrefixTemplateSnafu)?;
-        let tpl = tpl.confine(&self.confinement, Self::NAME, "key_prefix")?;
-        Ok(KeyPartitioner::new(tpl, None))
+        let ValidatedGcsSink { key_prefix, .. } =
+            self.validate().map_err(|errors| errors.join("; "))?;
+        Ok(KeyPartitioner::new(key_prefix, None))
     }
 }
 
@@ -508,42 +576,26 @@ impl RequestBuilder<(String, Vec<Event>)> for RequestSettings {
 }
 
 impl RequestSettings {
-    fn new(config: &GcsSinkConfig, cx: SinkContext) -> crate::Result<Self> {
+    fn new(
+        config: &GcsSinkConfig,
+        cx: SinkContext,
+        content_type: Option<HeaderValue>,
+        content_encoding: Option<HeaderValue>,
+        cache_control: Option<HeaderValue>,
+        metadata_headers: Vec<(HeaderName, HeaderValue)>,
+    ) -> crate::Result<Self> {
         let transformer = config.encoding.transformer();
         let (framer, serializer) = config.encoding.build(SinkType::MessageBased)?;
         let encoder = Encoder::<Framer>::new(framer, serializer);
         let acl = config
             .acl
             .map(|acl| HeaderValue::from_str(&to_string(acl)).unwrap());
-        let content_type_str = config
-            .content_type
-            .as_deref()
-            .unwrap_or_else(|| encoder.content_type());
-        let content_type = HeaderValue::from_str(content_type_str)?;
-        let content_encoding = match &config.content_encoding {
-            Some(ce) => Some(HeaderValue::from_str(ce)?),
-            None => config
-                .compression
-                .content_encoding()
-                .map(|ce| HeaderValue::from_str(&to_string(ce)).unwrap()),
+        let content_type = match content_type {
+            Some(content_type) => content_type,
+            None => HeaderValue::from_str(encoder.content_type())?,
         };
         let storage_class = config.storage_class.unwrap_or_default();
         let storage_class = HeaderValue::from_str(&to_string(storage_class)).unwrap();
-        let cache_control = config
-            .cache_control
-            .as_ref()
-            .map(|cc| HeaderValue::from_str(cc))
-            .transpose()?;
-        let metadata = config
-            .metadata
-            .as_ref()
-            .map(|metadata| {
-                metadata
-                    .iter()
-                    .map(make_header)
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .unwrap_or_else(|| Ok(vec![]))?;
         let extension = config
             .filename_extension
             .clone()
@@ -561,7 +613,7 @@ impl RequestSettings {
             content_encoding,
             storage_class,
             cache_control,
-            headers: metadata,
+            headers: metadata_headers,
             extension,
             time_format,
             append_uuid,
@@ -570,14 +622,6 @@ impl RequestSettings {
             tz_offset: offset,
         })
     }
-}
-
-// Make a header pair from a key-value string pair
-fn make_header((name, value): (&String, &String)) -> crate::Result<(HeaderName, HeaderValue)> {
-    Ok((
-        HeaderName::from_bytes(name.as_bytes())?,
-        HeaderValue::from_str(value)?,
-    ))
 }
 
 #[cfg(test)]
@@ -619,15 +663,14 @@ mod tests {
         let client =
             HttpClient::new(tls, context.proxy()).expect("should not fail to create HTTP client");
 
-        let config =
-            default_config((None::<FramingConfig>, JsonSerializerConfig::default()).into());
+        let config = GcsSinkConfig {
+            endpoint: mock_endpoint.to_string(),
+            bucket: "test-bucket".to_string(),
+            ..default_config((None::<FramingConfig>, JsonSerializerConfig::default()).into())
+        };
+        let validated = config.validate().expect("failed to validate sink");
         let sink = config
-            .build_sink(
-                client,
-                mock_endpoint.to_string(),
-                GcpAuthenticator::None,
-                context,
-            )
+            .build_sink(client, GcpAuthenticator::None, context, validated)
             .expect("failed to build sink");
 
         let event = Event::Log(LogEvent::from("simple message"));
@@ -656,7 +699,24 @@ mod tests {
     }
 
     fn request_settings(sink_config: &GcsSinkConfig, context: SinkContext) -> RequestSettings {
-        RequestSettings::new(sink_config, context).expect("Could not create request settings")
+        let ValidatedGcsSink {
+            content_type,
+            content_encoding,
+            cache_control,
+            metadata_headers,
+            ..
+        } = sink_config
+            .validate()
+            .expect("Could not validate request settings");
+        RequestSettings::new(
+            sink_config,
+            context,
+            content_type,
+            content_encoding,
+            cache_control,
+            metadata_headers,
+        )
+        .expect("Could not create request settings")
     }
 
     fn build_request(extension: Option<&str>, uuid: bool, compression: Compression) -> GcsRequest {
@@ -743,14 +803,13 @@ mod tests {
 
     #[test]
     fn gcs_content_type_invalid() {
-        let context = SinkContext::default();
         let sink_config = GcsSinkConfig {
             // Invalid header value with newline character
             content_type: Some("text/plain\nInvalid".to_string()),
             ..default_config((None::<FramingConfig>, TextSerializerConfig::default()).into())
         };
 
-        let result = RequestSettings::new(&sink_config, context);
+        let result = sink_config.validate();
         // Should return an error, not panic
         assert!(result.is_err());
     }
@@ -805,14 +864,13 @@ mod tests {
 
     #[test]
     fn gcs_content_encoding_invalid() {
-        let context = SinkContext::default();
         let sink_config = GcsSinkConfig {
             // Invalid header value with newline character
             content_encoding: Some("gzip\nInvalid".to_string()),
             ..default_config((None::<FramingConfig>, TextSerializerConfig::default()).into())
         };
 
-        let result = RequestSettings::new(&sink_config, context);
+        let result = sink_config.validate();
         // Should return an error, not panic
         assert!(result.is_err());
     }
@@ -865,14 +923,13 @@ mod tests {
 
     #[test]
     fn gcs_cache_control_invalid() {
-        let context = SinkContext::default();
         let sink_config = GcsSinkConfig {
             // Invalid header value with newline character
             cache_control: Some("no-cache\nInvalid".to_string()),
             ..default_config((None::<FramingConfig>, TextSerializerConfig::default()).into())
         };
 
-        let result = RequestSettings::new(&sink_config, context);
+        let result = sink_config.validate();
         // Should return an error, not panic
         assert!(result.is_err());
     }
@@ -1000,6 +1057,46 @@ mod tests {
         };
 
         config.validate_structure().unwrap();
+    }
+
+    #[test]
+    fn validate_yields_request_header_values_and_key_prefix() {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("x-meta-key".to_string(), "valid-value".to_string());
+
+        let config = GcsSinkConfig {
+            key_prefix: Some("key/{{ key }}/".into()),
+            content_type: Some("text/plain".to_string()),
+            content_encoding: Some("gzip".to_string()),
+            cache_control: Some("no-transform".to_string()),
+            metadata: Some(metadata),
+            ..default_config((None::<FramingConfig>, TextSerializerConfig::default()).into())
+        };
+
+        let ValidatedGcsSink {
+            key_prefix,
+            protocol,
+            content_type,
+            content_encoding,
+            cache_control,
+            metadata_headers,
+            ..
+        } = config.validate().unwrap();
+
+        assert_eq!(protocol, "https");
+        assert_eq!(content_type.unwrap().to_str().unwrap(), "text/plain");
+        assert_eq!(content_encoding.unwrap().to_str().unwrap(), "gzip");
+        assert_eq!(cache_control.unwrap().to_str().unwrap(), "no-transform");
+        assert_eq!(metadata_headers.len(), 1);
+        assert_eq!(metadata_headers[0].0.as_str(), "x-meta-key");
+        assert_eq!(metadata_headers[0].1.to_str().unwrap(), "valid-value");
+
+        let mut event = LogEvent::from("message");
+        event.insert(event_path!("key"), "value");
+        let key = KeyPartitioner::new(key_prefix, None)
+            .partition(&Event::Log(event))
+            .expect("key wasn't provided");
+        assert_eq!(key, "key/value/");
     }
 
     #[test]

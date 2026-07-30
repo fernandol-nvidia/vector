@@ -16,6 +16,11 @@ fn generate_config() {
     test_util::test_generate_config::<LokiConfig>();
 }
 
+fn new_loki_sink(config: LokiConfig, client: HttpClient) -> LokiSink {
+    let validated = config.validate().unwrap();
+    LokiSink::new(config, client, validated).unwrap()
+}
+
 #[tokio::test]
 async fn interpolate_labels() {
     let (config, cx) = load_sink::<LokiConfig>(
@@ -29,7 +34,7 @@ async fn interpolate_labels() {
     )
     .unwrap();
     let client = config.build_client(cx).unwrap();
-    let mut sink = LokiSink::new(config, client).unwrap();
+    let mut sink = new_loki_sink(config, client);
 
     let mut e1 = Event::Log(LogEvent::from("hello world"));
 
@@ -71,7 +76,7 @@ async fn use_label_from_dropped_fields() {
     )
     .unwrap();
     let client = config.build_client(cx).unwrap();
-    let mut sink = LokiSink::new(config, client).unwrap();
+    let mut sink = new_loki_sink(config, client);
 
     let mut e1 = Event::Log(LogEvent::from("hello world"));
 
@@ -166,7 +171,7 @@ async fn timestamp_out_of_range() {
     )
     .unwrap();
     let client = config.build_client(cx).unwrap();
-    let mut sink = LokiSink::new(config, client).unwrap();
+    let mut sink = new_loki_sink(config, client);
 
     let mut e1 = LogEvent::from("hello world");
     if let Some(timestamp_key) = log_schema().timestamp_key_target_path() {
@@ -197,7 +202,7 @@ async fn structured_metadata_as_json() {
     )
     .unwrap();
     let client = config.build_client(cx).unwrap();
-    let mut sink = LokiSink::new(config, client).unwrap();
+    let mut sink = new_loki_sink(config, client);
 
     let mut e1 = Event::Log(LogEvent::from("hello world"));
     e1.as_mut_log().insert(event_path!("foo"), "bar");

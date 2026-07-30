@@ -965,33 +965,22 @@ async fn http_uri_auth_conflict() {
     );
     let config: HttpSinkConfig = serde_yaml::from_str(&config).unwrap();
 
-    let cx = SinkContext::default();
+    // Credentials embedded in the URI and an explicit `auth` block are mutually exclusive.
+    // `build` now reports the same structural error that `validate_structure` reports, rather
+    // than constructing a sink that rejects every request at runtime. In a real Vector run this
+    // config never reaches `build` at all, because config compilation validates first.
+    let error = config
+        .build(SinkContext::default())
+        .await
+        .map(|_| ())
+        .expect_err("conflicting credentials must be rejected");
 
-    let (sink, _) = config.build(cx).await.unwrap();
-    let (rx, trigger, server) = build_test_server(in_addr);
-
-    let (batch, mut receiver) = BatchNotifier::new_with_receiver();
-    let mut event = Event::Log(LogEvent::default());
-    event.add_batch_notifier(batch);
-
-    tokio::spawn(server);
-
-    let expected_emitted_error_events = ["CallError", "SinkRequestBuildError"];
-    run_and_assert_sink_error_with_events(
-        sink,
-        stream::once(ready(event)),
-        &expected_emitted_error_events,
-        &COMPONENT_ERROR_TAGS,
-    )
-    .await;
-
-    drop(trigger);
-
-    assert_eq!(receiver.try_recv(), Ok(BatchStatus::Rejected));
-
-    // No requests should have been made to the server
-    let requests = rx.collect::<Vec<_>>().await;
-    assert!(requests.is_empty());
+    assert!(
+        error
+            .to_string()
+            .contains("Two authorization credentials was provided."),
+        "unexpected error: {error}"
+    );
 }
 
 fn parse_compressed_json<T>(compression: &str, buf: Bytes) -> T

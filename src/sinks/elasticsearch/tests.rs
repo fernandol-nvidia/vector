@@ -6,7 +6,6 @@ use vrl::event_path;
 
 use crate::{
     codecs::Transformer,
-    config::ProxyConfig,
     event::{LogEvent, Metric, MetricKind, MetricValue, ObjectMap, Value},
     sinks::{
         elasticsearch::{
@@ -693,16 +692,7 @@ async fn test_parse_config_with_uri_auth() {
         endpoints: vec!["http://user:pass@localhost:9200".to_string()],
         ..Default::default()
     };
-    let proxy = ProxyConfig::default();
-    let mut version = None;
-
-    let result = ElasticsearchCommon::parse_config(
-        &config,
-        "http://user:pass@localhost:9200",
-        &proxy,
-        &mut version,
-    )
-    .await;
+    let result = ElasticsearchCommon::parse_single(&config).await;
     assert!(result.is_ok());
     let common = result.unwrap();
 
@@ -738,12 +728,7 @@ async fn test_parse_config_with_config_auth() {
         endpoints: vec!["http://localhost:9200".to_string()],
         ..Default::default()
     };
-    let proxy = ProxyConfig::default();
-    let mut version = None;
-
-    let result =
-        ElasticsearchCommon::parse_config(&config, "http://localhost:9200", &proxy, &mut version)
-            .await;
+    let result = ElasticsearchCommon::parse_single(&config).await;
     assert!(result.is_ok());
     let common = result.unwrap();
 
@@ -774,16 +759,7 @@ async fn test_parse_config_with_conflicting_auth() {
         endpoints: vec!["http://uri_user:uri_pass@localhost:9200".to_string()],
         ..Default::default()
     };
-    let proxy = ProxyConfig::default();
-    let mut version = None;
-
-    let result = ElasticsearchCommon::parse_config(
-        &config,
-        "http://uri_user:uri_pass@localhost:9200",
-        &proxy,
-        &mut version,
-    )
-    .await;
+    let result = ElasticsearchCommon::parse_single(&config).await;
 
     // Should fail due to auth being specified in both places
     assert!(result.is_err());

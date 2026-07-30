@@ -214,31 +214,201 @@ impl LokiConfig {
     }
 }
 
-#[async_trait::async_trait]
-#[typetag::serde(name = "loki")]
-impl SinkConfig for LokiConfig {
-    async fn build(
-        &self,
-        cx: SinkContext,
-    ) -> crate::Result<(VectorSink, crate::sinks::Healthcheck)> {
+fn confine_template_map(
+    map: &HashMap<Template, Template>,
+    config: &ConfinementConfig,
+    component_name: &'static str,
+    key_field_name: &'static str,
+    value_field_name: &'static str,
+    errors: &mut Vec<String>,
+) -> Option<HashMap<ConfinedTemplate, ConfinedTemplate>> {
+    let mut confined = HashMap::with_capacity(map.len());
+    let mut valid = true;
+
+    for (k, v) in map {
+        let key = k
+            .clone()
+            .confine(config, component_name, key_field_name)
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+        let value = v
+            .clone()
+            .confine(config, component_name, value_field_name)
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
+        match (key, value) {
+            (Some(key), Some(value)) => {
+                confined.insert(key, value);
+            }
+            _ => valid = false,
+        }
+    }
+
+    valid.then_some(confined)
+}
+
+/// Values derived while validating [`LokiConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain the selected auth, confined templates,
+/// batcher settings, and protocol the sink uses is [`ValidateSink::validate`].
+#[derive(Debug)]
+pub struct ValidatedLokiSink {
+    auth: Option<Auth>,
+    protocol: &'static str,
+    tenant_id: Option<ConfinedTemplate>,
+    labels: HashMap<ConfinedTemplate, ConfinedTemplate>,
+    structured_metadata: HashMap<ConfinedTemplate, ConfinedTemplate>,
+    batch_settings: BatcherSettings,
+}
+
+impl ValidateSink for LokiConfig {
+    type Validated = ValidatedLokiSink;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        let mut errors = Vec::new();
+
+        let auth = self
+            .auth
+            .choose_one(&self.endpoint.auth)
+            .inspect_err(|_| {
+                errors.push(
+                    "Both `auth` and credentials in `endpoint` URL are set. Only one can be used."
+                        .to_string(),
+                );
+            })
+            .ok();
+
+        let scheme = self.endpoint.uri.scheme().map(|s| s.as_str()).unwrap_or("");
+        let protocol = match scheme {
+            "http" => Some("http"),
+            "https" => Some("https"),
+            _ => {
+                errors.push(format!(
+                    "endpoint: scheme must be 'http' or 'https', got '{}'",
+                    scheme
+                ));
+                None
+            }
+        };
+
         if self.labels.is_empty() {
-            return Err("`labels` must include at least one label.".into());
+            errors.push("`labels` must include at least one label.".to_string());
         }
 
         for label in self.labels.keys() {
             if !valid_label_name(label) {
-                return Err(format!("Invalid label name {:?}", label.get_ref()).into());
+                errors.push(format!("Invalid label name {:?}", label.get_ref()));
             }
         }
 
+        let tenant_id = self
+            .tenant_id
+            .clone()
+            .map(|template| template.confine(&self.confinement, Self::NAME, "tenant_id"))
+            .transpose()
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
+        let labels = confine_template_map(
+            &self.labels,
+            &self.confinement,
+            Self::NAME,
+            "labels[key]",
+            "labels[value]",
+            &mut errors,
+        );
+        let structured_metadata = confine_template_map(
+            &self.structured_metadata,
+            &self.confinement,
+            Self::NAME,
+            "structured_metadata[key]",
+            "structured_metadata[value]",
+            &mut errors,
+        );
+
+        let batch_settings = self
+            .batch
+            .into_batcher_settings()
+            .inspect_err(|e| errors.push(format!("batch: {e}")))
+            .ok();
+
+        // Validate encoding configuration (structural checks only, no I/O)
+        // This checks message_type format for Protobuf without reading the descriptor file.
+        if let Err(e) = self.encoding.validate_structure() {
+            errors.push(format!("encoding: {e}"));
+        }
+
+        match (
+            errors.is_empty(),
+            auth,
+            protocol,
+            tenant_id,
+            labels,
+            structured_metadata,
+            batch_settings,
+        ) {
+            (
+                true,
+                Some(auth),
+                Some(protocol),
+                Some(tenant_id),
+                Some(labels),
+                Some(structured_metadata),
+                Some(batch_settings),
+            ) => Ok(ValidatedLokiSink {
+                auth,
+                protocol,
+                tenant_id,
+                labels,
+                structured_metadata,
+                batch_settings,
+            }),
+            _ => Err(errors),
+        }
+    }
+}
+
+impl ValidatedLokiSink {
+    pub(super) fn into_sink_parts(
+        self,
+    ) -> (
+        Option<ConfinedTemplate>,
+        HashMap<ConfinedTemplate, ConfinedTemplate>,
+        HashMap<ConfinedTemplate, ConfinedTemplate>,
+        BatcherSettings,
+        &'static str,
+    ) {
+        (
+            self.tenant_id,
+            self.labels,
+            self.structured_metadata,
+            self.batch_settings,
+            self.protocol,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+#[typetag::serde(name = "loki")]
+impl SinkConfig for LokiConfig {
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        self.validate().map(|_| ())
+    }
+
+    async fn build(
+        &self,
+        cx: SinkContext,
+    ) -> crate::Result<(VectorSink, crate::sinks::Healthcheck)> {
+        let validated = self.validate().map_err(|errors| errors.join("; "))?;
         let client = self.build_client(cx)?;
 
         let config = LokiConfig {
-            auth: self.auth.choose_one(&self.endpoint.auth)?,
+            auth: validated.auth.clone(),
             ..self.clone()
         };
 
-        let sink = LokiSink::new(config.clone(), client.clone())?;
+        let sink = LokiSink::new(config.clone(), client.clone(), validated)?;
 
         let healthcheck = healthcheck(config, client).boxed();
         Ok((VectorSink::from_event_streamsink(sink), healthcheck))
@@ -258,83 +428,6 @@ impl SinkConfig for LokiConfig {
 
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
-    }
-
-    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        // Check for duplicate credentials (mirrors build() check)
-        if self.auth.is_some() && self.endpoint.auth.is_some() {
-            errors.push(
-                "Both `auth` and credentials in `endpoint` URL are set. Only one can be used."
-                    .to_string(),
-            );
-        }
-
-        // Validate endpoint scheme is http or https (get_http_scheme_from_uri panics otherwise)
-        let scheme = self.endpoint.uri.scheme().map(|s| s.as_str()).unwrap_or("");
-        if scheme != "http" && scheme != "https" {
-            errors.push(format!(
-                "endpoint: scheme must be 'http' or 'https', got '{}'",
-                scheme
-            ));
-        }
-
-        // Check for empty labels (mirrors build() check)
-        if self.labels.is_empty() {
-            errors.push("`labels` must include at least one label.".to_string());
-        }
-
-        // Validate label names (mirrors build() check)
-        for label in self.labels.keys() {
-            if !valid_label_name(label) {
-                errors.push(format!("Invalid label name {:?}", label.get_ref()));
-            }
-        }
-
-        // Validate tenant_id confinement
-        if let Some(tenant_id) = self.tenant_id.clone()
-            && let Err(e) = tenant_id.confine(&self.confinement, Self::NAME, "tenant_id")
-        {
-            errors.push(e.to_string());
-        }
-
-        // Validate labels confinement (both keys and values)
-        for (k, v) in self.labels.clone().into_iter() {
-            if let Err(e) = k.confine(&self.confinement, Self::NAME, "labels[key]") {
-                errors.push(e.to_string());
-            }
-            if let Err(e) = v.confine(&self.confinement, Self::NAME, "labels[value]") {
-                errors.push(e.to_string());
-            }
-        }
-
-        // Validate structured_metadata confinement (both keys and values)
-        for (k, v) in self.structured_metadata.clone().into_iter() {
-            if let Err(e) = k.confine(&self.confinement, Self::NAME, "structured_metadata[key]") {
-                errors.push(e.to_string());
-            }
-            if let Err(e) = v.confine(&self.confinement, Self::NAME, "structured_metadata[value]") {
-                errors.push(e.to_string());
-            }
-        }
-
-        // Validate batch settings (mirrors self.batch.into_batcher_settings()? in LokiSink::new())
-        if let Err(e) = self.batch.validate() {
-            errors.push(format!("batch: {e}"));
-        }
-
-        // Validate encoding configuration (structural checks only, no I/O)
-        // This checks message_type format for Protobuf without reading the descriptor file.
-        if let Err(e) = self.encoding.validate_structure() {
-            errors.push(format!("encoding: {e}"));
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
     }
 }
 
@@ -367,7 +460,7 @@ pub fn valid_label_name(label: &Template) -> bool {
 mod tests {
     use std::convert::TryInto;
 
-    use super::valid_label_name;
+    use super::{LokiConfig, valid_label_name};
     use crate::template::{ConfinementConfig, Template};
 
     #[test]
@@ -423,6 +516,90 @@ mod tests {
         assert!(
             rendered.starts_with("team-"),
             "operator-controlled prefix must be preserved in rendered tenant_id"
+        );
+    }
+
+    #[test]
+    fn validate_yields_confined_templates() {
+        use std::collections::HashMap;
+
+        use crate::{
+            config::ValidateSink,
+            event::{Event, LogEvent},
+        };
+        use vrl::event_path;
+
+        let mut labels = HashMap::new();
+        labels.insert(
+            Template::try_from("label_{{ label }}").unwrap(),
+            Template::try_from("value_{{ value }}").unwrap(),
+        );
+
+        let mut structured_metadata = HashMap::new();
+        structured_metadata.insert(
+            Template::try_from("metadata_{{ metadata_key }}").unwrap(),
+            Template::try_from("metadata_value_{{ metadata_value }}").unwrap(),
+        );
+
+        let config = LokiConfig {
+            tenant_id: Some(Template::try_from("tenant-{{ tenant }}").unwrap()),
+            labels,
+            structured_metadata,
+            ..toml::from_str::<LokiConfig>(
+                r#"
+endpoint = "http://localhost:3100"
+encoding.codec = "text"
+labels = {"static_label" = "static_value"}
+"#,
+            )
+            .unwrap()
+        };
+
+        let validated = config.validate().expect("config is valid");
+
+        let mut event = LogEvent::default();
+        event.insert(event_path!("tenant"), "team");
+        event.insert(event_path!("label"), "env");
+        event.insert(event_path!("value"), "prod");
+        event.insert(event_path!("metadata_key"), "source");
+        event.insert(event_path!("metadata_value"), "vector");
+        let event = Event::from(event);
+
+        assert_eq!(
+            validated
+                .tenant_id
+                .as_ref()
+                .unwrap()
+                .render_string(&event)
+                .unwrap(),
+            "tenant-team"
+        );
+
+        let rendered_labels = validated
+            .labels
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.render_string(&event).unwrap(),
+                    value.render_string(&event).unwrap(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(rendered_labels["label_env"].as_str(), "value_prod");
+
+        let rendered_metadata = validated
+            .structured_metadata
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.render_string(&event).unwrap(),
+                    value.render_string(&event).unwrap(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            rendered_metadata["metadata_source"].as_str(),
+            "metadata_value_vector"
         );
     }
 

@@ -197,17 +197,76 @@ impl GenerateConfig for RedisSinkConfig {
     }
 }
 
-#[async_trait::async_trait]
-#[typetag::serde(name = "redis")]
-impl SinkConfig for RedisSinkConfig {
-    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+/// Values derived while validating [`RedisSinkConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain the confined template the sink renders with
+/// is [`ValidateSink::validate`].
+#[derive(Debug)]
+pub struct ValidatedRedisSink {
+    key: ConfinedTemplate,
+}
+
+impl ValidateSink for RedisSinkConfig {
+    type Validated = ValidatedRedisSink;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        let mut errors = Vec::new();
+
         if self.key.is_empty() {
-            return Err("`key` cannot be empty.".into());
+            errors.push("`key` cannot be empty.".to_string());
         }
+
         let key = self
             .key
             .clone()
-            .confine(&self.confinement, Self::NAME, "key")?;
+            .confine(&self.confinement, Self::NAME, "key")
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
+        // Validate endpoints.
+        let endpoints = self.endpoint.clone().to_vec();
+        if endpoints.is_empty() {
+            errors.push("`endpoint` cannot be empty.".to_string());
+        } else if self.sentinel_service.is_some() {
+            // For sentinel, validate all sentinel endpoint URLs parse correctly.
+            for endpoint in &endpoints {
+                if let Err(e) = redis::Client::open(endpoint.as_str()) {
+                    errors.push(format!("`endpoint` '{endpoint}' is invalid: {e}"));
+                }
+            }
+        } else {
+            // For non-sentinel, validate the first endpoint can be parsed.
+            if let Err(e) = redis::Client::open(endpoints[0].as_str()) {
+                errors.push(format!("`endpoint` is invalid: {e}"));
+            }
+        }
+
+        // Validate batch settings.
+        if let Err(e) = self.batch.validate() {
+            errors.push(format!("batch: {e}"));
+        }
+
+        // Validate encoding configuration (structural checks only, no I/O).
+        if let Err(e) = self.encoding.validate_structure() {
+            errors.push(format!("encoding: {e}"));
+        }
+
+        match (errors.is_empty(), key) {
+            (true, Some(key)) => Ok(ValidatedRedisSink { key }),
+            _ => Err(errors),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+#[typetag::serde(name = "redis")]
+impl SinkConfig for RedisSinkConfig {
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        self.validate().map(|_| ())
+    }
+
+    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        let ValidatedRedisSink { key } = self.validate().map_err(|errors| errors.join("; "))?;
         let conn = self.build_connection().await?;
         let healthcheck = RedisSinkConfig::healthcheck(conn.clone()).boxed();
         let sink = RedisSink::new(self, conn, key)?;
@@ -224,58 +283,6 @@ impl SinkConfig for RedisSinkConfig {
 
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
-    }
-
-    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        if self.key.is_empty() {
-            errors.push("`key` cannot be empty.".to_string());
-        }
-
-        if let Err(e) = self
-            .key
-            .clone()
-            .confine(&self.confinement, Self::NAME, "key")
-        {
-            errors.push(e.to_string());
-        }
-
-        // Validate endpoints (mirrors build_connection check)
-        let endpoints = self.endpoint.clone().to_vec();
-        if endpoints.is_empty() {
-            errors.push("`endpoint` cannot be empty.".to_string());
-        } else if self.sentinel_service.is_some() {
-            // For sentinel, validate all sentinel endpoint URLs parse correctly
-            // Sentinel::build expects valid URL strings for each endpoint
-            for endpoint in &endpoints {
-                if let Err(e) = redis::Client::open(endpoint.as_str()) {
-                    errors.push(format!("`endpoint` '{endpoint}' is invalid: {e}"));
-                }
-            }
-        } else {
-            // For non-sentinel, validate the first endpoint can be parsed
-            // redis::Client::open will parse the URL
-            if let Err(e) = redis::Client::open(endpoints[0].as_str()) {
-                errors.push(format!("`endpoint` is invalid: {e}"));
-            }
-        }
-
-        // Validate batch settings (mirrors RedisSink::new check)
-        if let Err(e) = self.batch.validate() {
-            errors.push(format!("batch: {e}"));
-        }
-
-        // Validate encoding configuration (structural checks only, no I/O)
-        if let Err(e) = self.encoding.validate_structure() {
-            errors.push(format!("encoding: {e}"));
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
     }
 }
 
@@ -450,6 +457,37 @@ mod tests {
         let config = ConfinementConfig::default();
         let result = template.confine(&config, "redis", "key");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_yields_confined_key() {
+        use super::*;
+        use crate::sinks::util::TowerRequestConfig;
+        use crate::sinks::util::batch::BatchConfig;
+        use vrl::event_path;
+
+        let config = RedisSinkConfig {
+            key: Template::try_from("events-{{ env }}").unwrap(),
+            endpoint: vec!["redis://127.0.0.1:6379".to_string()].into(),
+            encoding: EncodingConfig::from(TextSerializerConfig::default()),
+            data_type: DataTypeConfig::default(),
+            list_option: None,
+            sorted_set_option: None,
+            sentinel_service: None,
+            sentinel_connect: None,
+            batch: BatchConfig::default(),
+            request: TowerRequestConfig::default(),
+            acknowledgements: AcknowledgementsConfig::default(),
+            confinement: ConfinementConfig::default(),
+        };
+
+        let validated = config.validate().expect("config is valid");
+
+        let mut event = LogEvent::from_str_legacy("message");
+        event.insert(event_path!("env"), "prod");
+        let event = Event::from(event);
+
+        assert_eq!(validated.key.render_string(&event).unwrap(), "events-prod");
     }
 
     #[test]

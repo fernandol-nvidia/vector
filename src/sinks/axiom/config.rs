@@ -9,11 +9,14 @@ use vector_lib::{
 
 use crate::{
     codecs::{EncodingConfigWithFraming, Transformer},
-    config::{AcknowledgementsConfig, DataType, GenerateConfig, Input, SinkConfig, SinkContext},
+    config::{
+        AcknowledgementsConfig, DataType, GenerateConfig, Input, SinkConfig, SinkContext,
+        ValidateSink,
+    },
     http::Auth as HttpAuthConfig,
     sinks::{
         Healthcheck, VectorSink,
-        http::config::{HttpMethod, HttpSinkConfig},
+        http::config::{HttpMethod, HttpSinkConfig, ValidatedHttpSink},
         util::{
             BatchConfig, Compression, RealtimeSizeBasedDefaultBatchSettings,
             http::{RequestConfig, RetryStrategy},
@@ -147,13 +150,84 @@ impl GenerateConfig for AxiomConfig {
     }
 }
 
+/// Values derived while validating [`AxiomConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain the HTTP configuration and validated HTTP
+/// values Axiom delegates to is [`ValidateSink::validate`].
+#[derive(Debug)]
+pub struct ValidatedAxiom {
+    http_sink_config: HttpSinkConfig,
+    http: ValidatedHttpSink,
+}
+
+impl ValidateSink for AxiomConfig {
+    type Validated = ValidatedAxiom;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        let mut errors = Vec::new();
+
+        self.endpoint
+            .validate()
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
+        let uri = crate::template::Template::try_from(self.build_endpoint())
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
+        let http_sink_config = uri.map(|uri| self.build_http_sink_config(uri));
+        let http = http_sink_config.as_ref().and_then(|http_sink_config| {
+            http_sink_config
+                .validate_with_component_type(Self::NAME)
+                .inspect_err(|http_errors| errors.extend(http_errors.iter().cloned()))
+                .ok()
+        });
+
+        match (errors.is_empty(), http_sink_config, http) {
+            (true, Some(http_sink_config), Some(http)) => Ok(ValidatedAxiom {
+                http_sink_config,
+                http,
+            }),
+            _ => Err(errors),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 #[typetag::serde(name = "axiom")]
 impl SinkConfig for AxiomConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        // Validate that url and region are not both set
-        self.endpoint.validate()?;
+        let ValidatedAxiom {
+            http_sink_config,
+            http,
+        } = self.validate().map_err(|errors| errors.join("; "))?;
 
+        // Route through the HTTP builder with values validated using our own component type, so
+        // per-template confinement diagnostics carry `component_type=axiom` rather than `http`.
+        http_sink_config
+            .build_with_component_type(cx, Self::NAME, http)
+            .await
+    }
+
+    fn confinement_config(&self) -> Option<&crate::template::ConfinementConfig> {
+        Some(&self.confinement)
+    }
+
+    fn input(&self) -> Input {
+        Input::new(DataType::Metric | DataType::Log | DataType::Trace)
+    }
+
+    fn acknowledgements(&self) -> &AcknowledgementsConfig {
+        &self.acknowledgements
+    }
+
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        self.validate().map(|_| ())
+    }
+}
+
+impl AxiomConfig {
+    fn build_http_sink_config(&self, uri: crate::template::Template) -> HttpSinkConfig {
         let mut request = self.request.clone();
         if let Some(org_id) = &self.org_id {
             // NOTE: Only add the org id header if an org id is provided
@@ -167,9 +241,8 @@ impl SinkConfig for AxiomConfig {
         // the vector HTTP sink with the necessary adjustments to send data
         // to Axiom, whilst keeping the configuration simple and easy to use
         // and maintenance of the vector axiom sink to a minimum.
-        //
-        let http_sink_config = HttpSinkConfig {
-            uri: self.build_endpoint().try_into()?,
+        HttpSinkConfig {
+            uri,
             compression: self.compression,
             auth: Some(HttpAuthConfig::Bearer {
                 token: self.token.clone(),
@@ -191,77 +264,9 @@ impl SinkConfig for AxiomConfig {
             payload_suffix: "".into(), // Always newline delimited JSON
             retry_strategy: self.retry_strategy.clone(),
             confinement: self.confinement.clone(),
-        };
-
-        // Route through the HTTP builder threaded with our own component type,
-        // so per-template security warnings carry `component_type=axiom` rather
-        // than `http`.
-        http_sink_config
-            .build_with_component_type(cx, Self::NAME)
-            .await
-    }
-
-    fn confinement_config(&self) -> Option<&crate::template::ConfinementConfig> {
-        Some(&self.confinement)
-    }
-
-    fn input(&self) -> Input {
-        Input::new(DataType::Metric | DataType::Log | DataType::Trace)
-    }
-
-    fn acknowledgements(&self) -> &AcknowledgementsConfig {
-        &self.acknowledgements
-    }
-
-    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        // Validate endpoint settings (url and region must not both be set)
-        if let Err(e) = self.endpoint.validate() {
-            return Err(vec![e.to_string()]);
         }
-
-        // Build HTTP config for validation (mirrors build() logic)
-        let uri: crate::template::Template = match self.build_endpoint().try_into() {
-            Ok(uri) => uri,
-            Err(e) => return Err(vec![e.to_string()]),
-        };
-
-        let mut request = self.request.clone();
-        if let Some(org_id) = &self.org_id {
-            request
-                .headers
-                .insert("X-Axiom-Org-Id".to_string(), org_id.clone());
-        }
-
-        let http_sink_config = HttpSinkConfig {
-            uri,
-            compression: self.compression,
-            auth: Some(HttpAuthConfig::Bearer {
-                token: self.token.clone(),
-            }),
-            method: HttpMethod::Post,
-            tls: self.tls.clone(),
-            request,
-            acknowledgements: self.acknowledgements,
-            batch: self.batch,
-            encoding: EncodingConfigWithFraming::new(
-                Some(FramingConfig::NewlineDelimited),
-                SerializerConfig::Json(JsonSerializerConfig {
-                    metric_tag_values: MetricTagValues::Single,
-                    options: JsonSerializerOptions { pretty: false },
-                }),
-                Transformer::default(),
-            ),
-            payload_prefix: "".into(),
-            payload_suffix: "".into(),
-            retry_strategy: self.retry_strategy.clone(),
-            confinement: self.confinement.clone(),
-        };
-
-        http_sink_config.validate_structure()
     }
-}
 
-impl AxiomConfig {
     fn build_endpoint(&self) -> String {
         // Priority: url > region > default cloud endpoint
 

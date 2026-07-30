@@ -8,7 +8,10 @@ use vector_lib::{
 use super::config_host_key_target_path;
 use crate::{
     codecs::EncodingConfig,
-    config::{AcknowledgementsConfig, DataType, GenerateConfig, Input, SinkConfig, SinkContext},
+    config::{
+        AcknowledgementsConfig, DataType, GenerateConfig, Input, SinkConfig, SinkContext,
+        ValidateSink,
+    },
     sinks::{
         Healthcheck, VectorSink,
         splunk_hec::{
@@ -17,7 +20,7 @@ use crate::{
                 acknowledgements::HecClientAcknowledgementsConfig,
                 config_timestamp_key_target_path,
             },
-            logs::config::HecLogsSinkConfig,
+            logs::config::{HecLogsSinkConfig, ValidatedHecLogsSink},
         },
         util::{BatchConfig, Compression, TowerRequestConfig},
     },
@@ -176,11 +179,41 @@ impl GenerateConfig for HumioLogsConfig {
     }
 }
 
+/// Values derived while validating [`HumioLogsConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain the delegated HEC config and its validated
+/// values is [`ValidateSink::validate`] or the component-type-aware helper used by wrapping sinks.
+#[derive(Debug)]
+pub struct ValidatedHumioLogsSink {
+    hec_config: HecLogsSinkConfig,
+    hec: ValidatedHecLogsSink,
+}
+
+impl HumioLogsConfig {
+    pub(super) fn validate_with_component_type(
+        &self,
+        component_name: &'static str,
+    ) -> std::result::Result<ValidatedHumioLogsSink, Vec<String>> {
+        let hec_config = self.build_hec_config();
+        let hec = hec_config.validate_with_component_type(component_name)?;
+        Ok(ValidatedHumioLogsSink { hec_config, hec })
+    }
+}
+
+impl ValidateSink for HumioLogsConfig {
+    type Validated = ValidatedHumioLogsSink;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        self.validate_with_component_type(Self::NAME)
+    }
+}
+
 #[async_trait::async_trait]
 #[typetag::serde(name = "humio_logs")]
 impl SinkConfig for HumioLogsConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        self.build_with_component_type(cx, Self::NAME)
+        let validated = self.validate().map_err(|errors| errors.join("; "))?;
+        self.build_with_validated(cx, validated)
     }
 
     fn confinement_config(&self) -> Option<&crate::template::ConfinementConfig> {
@@ -196,23 +229,18 @@ impl SinkConfig for HumioLogsConfig {
     }
 
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        // Delegate to HEC config validation with the outer component name
-        self.build_hec_config().validate_structure()
+        self.validate().map(|_| ())
     }
 }
 
 impl HumioLogsConfig {
-    /// Confinement + sink construction. `component_name` is threaded through so
-    /// per-template security warnings carry the outer sink type — `humio_logs`
-    /// when this is the top-level sink, `humio_metrics` when
-    /// [`HumioMetricsConfig::build`] delegates here.
-    pub(super) fn build_with_component_type(
+    pub(super) fn build_with_validated(
         &self,
         cx: SinkContext,
-        component_name: &'static str,
+        validated: ValidatedHumioLogsSink,
     ) -> crate::Result<(VectorSink, Healthcheck)> {
-        self.build_hec_config()
-            .build_with_component_type(cx, component_name)
+        let ValidatedHumioLogsSink { hec_config, hec } = validated;
+        hec_config.build_with_validated(cx, hec)
     }
 
     pub(super) fn build_hec_config(&self) -> HecLogsSinkConfig {

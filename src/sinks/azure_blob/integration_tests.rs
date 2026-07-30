@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use vrl::event_path;
 
-use azure_core::http::StatusCode;
+use azure_core::http::{StatusCode, Url};
 use azure_storage_blob::BlobContainerClient;
 
 use bytes::{Buf, BytesMut};
@@ -19,6 +19,7 @@ use vector_lib::{
 
 use super::config::AzureBlobSinkConfig;
 use crate::{
+    config::ValidateSink,
     event::{Event, EventArray, LogEvent},
     sinks::{
         VectorSink, azure_blob, azure_common,
@@ -299,14 +300,24 @@ impl AzureBlobSinkConfig {
     }
 
     async fn build_test_client(&self) -> Arc<BlobContainerClient> {
+        let connection_string = self
+            .connection_string
+            .clone()
+            .expect("failed to unwrap connection_string");
+        let parsed_connection_string =
+            azure_common::connection_string::ParsedConnectionString::parse(
+                connection_string.inner(),
+            )
+            .expect("Failed to parse connection string");
+        let container_url = parsed_connection_string
+            .container_url(&self.container_name)
+            .expect("Failed to build container URL");
+        let url = Url::parse(&container_url).expect("Failed to parse container URL");
+
         azure_blob::config::build_client(
             self.auth.clone(),
-            self.connection_string
-                .clone()
-                .expect("failed to unwrap connection_string")
-                .inner()
-                .to_string(),
-            self.container_name.clone(),
+            &parsed_connection_string,
+            url,
             &crate::config::ProxyConfig::default(),
             self.tls.clone(),
         )
@@ -316,7 +327,9 @@ impl AzureBlobSinkConfig {
 
     async fn to_sink(&self) -> VectorSink {
         let client = self.build_test_client().await;
-        self.build_processor(client).expect("Failed to create sink")
+        let validated = self.validate().expect("Failed to validate sink");
+        self.build_processor(client, validated)
+            .expect("Failed to create sink")
     }
 
     async fn run_assert(&self, input: impl Stream<Item = EventArray> + Send) {

@@ -17,6 +17,7 @@ use crate::{
 };
 use futures;
 use futures_util::TryFutureExt;
+use http::Uri;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -146,16 +147,127 @@ impl Default for DorisConfig {
 
 impl_generate_config_from_default!(DorisConfig);
 
+#[derive(Clone, Debug)]
+pub(super) struct ValidatedDorisEndpoint {
+    base_url: Uri,
+    auth: Option<Auth>,
+}
+
+impl ValidatedDorisEndpoint {
+    pub(super) const fn base_url(&self) -> &Uri {
+        &self.base_url
+    }
+
+    pub(super) const fn auth(&self) -> Option<&Auth> {
+        self.auth.as_ref()
+    }
+}
+
+/// Values derived while validating [`DorisConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain the endpoint authentication, confined
+/// templates, and batcher settings the sink uses is [`ValidateSink::validate`].
+#[derive(Debug)]
+pub struct ValidatedDoris {
+    endpoints: Vec<ValidatedDorisEndpoint>,
+    batch_settings: BatcherSettings,
+    database: ConfinedTemplate,
+    table: ConfinedTemplate,
+}
+
+impl ValidatedDoris {
+    pub(super) fn endpoints(&self) -> &[ValidatedDorisEndpoint] {
+        &self.endpoints
+    }
+}
+
+impl ValidateSink for DorisConfig {
+    type Validated = ValidatedDoris;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        let mut errors = Vec::new();
+
+        let mut endpoints = Vec::new();
+        if self.endpoints.is_empty() {
+            errors.push("No endpoints configured.".to_string());
+        } else {
+            for endpoint in &self.endpoints {
+                if endpoint.uri.host().is_none() {
+                    errors.push(format!(
+                        "Invalid endpoint: {}, host must include hostname",
+                        endpoint.uri
+                    ));
+                }
+
+                let auth = self
+                    .auth
+                    .choose_one(&endpoint.auth)
+                    .inspect_err(|e| errors.push(format!("auth conflict: {e}")))
+                    .ok();
+
+                if let Some(auth) = auth {
+                    endpoints.push(ValidatedDorisEndpoint {
+                        base_url: endpoint.uri.clone(),
+                        auth,
+                    });
+                }
+            }
+        }
+
+        let batch_settings = self
+            .batch
+            .into_batcher_settings()
+            .inspect_err(|e| errors.push(format!("batch: {e}")))
+            .ok();
+
+        // Validate encoding configuration (structural checks only, no I/O)
+        if let Err(e) = self.encoding.validate_structure() {
+            errors.push(format!("encoding: {e}"));
+        }
+
+        let database = self
+            .database
+            .clone()
+            .confine(&self.confinement, Self::NAME, "database")
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
+        let table = self
+            .table
+            .clone()
+            .confine(&self.confinement, Self::NAME, "table")
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
+        match (
+            errors.is_empty(),
+            !endpoints.is_empty(),
+            batch_settings,
+            database,
+            table,
+        ) {
+            (true, true, Some(batch_settings), Some(database), Some(table)) => Ok(ValidatedDoris {
+                endpoints,
+                batch_settings,
+                database,
+                table,
+            }),
+            _ => Err(errors),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 #[typetag::serde(name = "doris")]
 impl SinkConfig for DorisConfig {
-    async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let endpoints = self.endpoints.clone();
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        self.validate().map(|_| ())
+    }
 
-        if endpoints.is_empty() {
-            return Err("No endpoints configured.'.".into());
-        }
-        let commons = DorisCommon::parse_many(self).await?;
+    async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        let validated = self.validate().map_err(|errors| errors.join("; "))?;
+
+        let commons = DorisCommon::parse_many(self, &validated)?;
         let common = commons[0].clone();
 
         let client = HttpClient::new(common.tls_settings.clone(), &cx.proxy)?;
@@ -215,8 +327,15 @@ impl SinkConfig for DorisConfig {
             1, // Buffer bound is hardcoded to 1 for sinks
         );
 
+        let ValidatedDoris {
+            batch_settings,
+            database,
+            table,
+            ..
+        } = validated;
+
         // Create DorisSink with the configured service
-        let sink = DorisSink::new(service, self, &common)?;
+        let sink = DorisSink::new(service, &common, batch_settings, database, table);
 
         let sink = VectorSink::from_event_streamsink(sink);
 
@@ -254,58 +373,6 @@ impl SinkConfig for DorisConfig {
 
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
-    }
-
-    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        if self.endpoints.is_empty() {
-            errors.push("No endpoints configured.".to_string());
-        } else {
-            // Check each endpoint has a host and no auth conflict
-            for endpoint in &self.endpoints {
-                if endpoint.uri.host().is_none() {
-                    errors.push(format!(
-                        "Invalid endpoint: {}, host must include hostname",
-                        endpoint.uri
-                    ));
-                }
-                if let Err(e) = self.auth.choose_one(&endpoint.auth) {
-                    errors.push(format!("auth conflict: {e}"));
-                }
-            }
-        }
-
-        if let Err(e) = self.batch.validate() {
-            errors.push(format!("batch: {e}"));
-        }
-
-        // Validate encoding configuration (structural checks only, no I/O)
-        if let Err(e) = self.encoding.validate_structure() {
-            errors.push(format!("encoding: {e}"));
-        }
-
-        if let Err(e) = self
-            .database
-            .clone()
-            .confine(&self.confinement, Self::NAME, "database")
-        {
-            errors.push(e.to_string());
-        }
-
-        if let Err(e) = self
-            .table
-            .clone()
-            .confine(&self.confinement, Self::NAME, "table")
-        {
-            errors.push(e.to_string());
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
     }
 }
 
@@ -359,6 +426,45 @@ mod tests {
             result.is_err(),
             "dotdot escape in rendered value must be rejected by prefix check"
         );
+    }
+
+    #[test]
+    fn validate_yields_confined_templates_and_batcher_settings() {
+        use crate::{
+            event::{Event, LogEvent},
+            sinks::util::{UriSerde, batch::BatchConfig},
+        };
+        use vrl::event_path;
+
+        let mut batch = BatchConfig::default();
+        batch.max_bytes = Some(1024);
+        batch.max_events = Some(10);
+
+        let config = DorisConfig {
+            endpoints: vec!["http://doris.example.com:8030".parse::<UriSerde>().unwrap()],
+            database: Template::try_from("db_{{ tenant }}").unwrap(),
+            table: Template::try_from("table_{{ stream }}").unwrap(),
+            batch,
+            ..Default::default()
+        };
+
+        let validated = config.validate().expect("config is valid");
+
+        let mut event = LogEvent::default();
+        event.insert(event_path!("tenant"), "prod");
+        event.insert(event_path!("stream"), "logs");
+        let event = Event::from(event);
+
+        assert_eq!(validated.endpoints.len(), 1);
+        assert_eq!(
+            validated.endpoints[0].base_url.host(),
+            Some("doris.example.com")
+        );
+        assert!(validated.endpoints[0].auth.is_none());
+        assert_eq!(validated.database.render_string(&event).unwrap(), "db_prod");
+        assert_eq!(validated.table.render_string(&event).unwrap(), "table_logs");
+        assert_eq!(validated.batch_settings.size_limit, 1024);
+        assert_eq!(validated.batch_settings.item_limit, 10);
     }
 
     #[test]

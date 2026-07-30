@@ -1,6 +1,9 @@
 //! Configuration for the `http` sink.
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 #[cfg(feature = "aws-core")]
 use aws_config::meta::region::ProvideRegion;
@@ -237,11 +240,187 @@ pub(super) fn validate_payload_wrapper(
     }
 }
 
+/// Values derived while validating [`HttpSinkConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain the confined templates and other derived
+/// settings the sink uses is [`ValidateSink::validate`] or the component-aware validator used by
+/// wrapper sinks.
+#[derive(Debug)]
+pub struct ValidatedHttpSink {
+    batch_settings: BatcherSettings,
+    encoder: Option<Encoder<Framer>>,
+    payload_prefix: String,
+    payload_suffix: String,
+    static_headers: BTreeMap<OrderedHeaderName, HeaderValue>,
+    template_headers: BTreeMap<String, ConfinedTemplate>,
+    uri: ConfinedTemplate,
+}
+
+impl ValidateSink for HttpSinkConfig {
+    type Validated = ValidatedHttpSink;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        self.validate_with_component_type(Self::NAME)
+    }
+}
+
+impl HttpSinkConfig {
+    pub(crate) fn validate_with_component_type(
+        &self,
+        component_name: &'static str,
+    ) -> std::result::Result<ValidatedHttpSink, Vec<String>> {
+        let mut errors = Vec::new();
+
+        let batch_settings = self
+            .batch
+            .into_batcher_settings()
+            .inspect_err(|e| errors.push(format!("batch: {e}")))
+            .ok();
+
+        let uri = self
+            .uri
+            .clone()
+            .confine(&self.confinement, component_name, "uri")
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
+        if !self.uri.is_dynamic() {
+            match self.uri.get_ref().parse::<UriSerde>() {
+                Ok(uri_serde) => {
+                    let scheme = uri_serde.uri.scheme();
+                    if scheme.is_none() {
+                        errors.push("uri: must include a scheme (http:// or https://)".to_string());
+                    }
+                    if let Some(s) = scheme
+                        && s != "http"
+                        && s != "https"
+                    {
+                        errors.push(format!("uri: scheme must be http or https, got '{}'", s));
+                    }
+                    if uri_serde.uri.host().is_none() {
+                        errors.push("uri: must include a host".to_string());
+                    }
+                    if let Err(e) = self.auth.choose_one(&uri_serde.auth) {
+                        errors.push(format!("auth: {e}"));
+                    }
+                }
+                Err(e) => {
+                    errors.push(format!("uri: invalid URI: {e}"));
+                }
+            }
+        } else if let Ok(uri_serde) = self.uri.literal_prefix().parse::<UriSerde>()
+            && self.auth.choose_one(&uri_serde.auth).is_err()
+        {
+            errors.push(
+                "uri: contains embedded credentials that conflict with `auth`. Remove credentials from the URI or remove `auth`.".to_string(),
+            );
+        }
+
+        let request_headers = validate_headers(&self.request.headers, self.auth.is_some())
+            .inspect_err(|e| errors.push(format!("request.headers: {e}")))
+            .ok();
+
+        let (static_headers, template_headers) = self.request.split_headers();
+
+        let static_header_names = static_headers
+            .keys()
+            .filter_map(|name| {
+                HeaderName::from_bytes(name.as_bytes())
+                    .ok()
+                    .map(OrderedHeaderName::from)
+            })
+            .collect::<BTreeSet<_>>();
+
+        let static_headers = request_headers.map(|headers| {
+            headers
+                .into_iter()
+                .filter(|(name, _)| static_header_names.contains(name))
+                .collect::<BTreeMap<_, _>>()
+        });
+
+        let mut confined_template_headers = BTreeMap::new();
+        let mut template_headers_valid = true;
+        for (name, tpl) in template_headers.into_iter() {
+            match tpl.confine(&self.confinement, component_name, "request.headers") {
+                Ok(tpl) => {
+                    if template_headers_valid {
+                        confined_template_headers.insert(name, tpl);
+                    }
+                }
+                Err(e) => {
+                    errors.push(format!("headers.{}: {}", name, e));
+                    template_headers_valid = false;
+                }
+            }
+        }
+        let template_headers = template_headers_valid.then_some(confined_template_headers);
+
+        if let Err(e) = self.encoding.validate_structure() {
+            errors.push(format!("encoding: {e}"));
+        }
+
+        let serializer = self.encoding.config().1;
+        let needs_external_file = matches!(
+            serializer,
+            vector_lib::codecs::encoding::SerializerConfig::Protobuf(_)
+        );
+
+        let encoder = if needs_external_file {
+            None
+        } else {
+            self.build_encoder()
+                .inspect_err(|e| errors.push(format!("encoding: {e}")))
+                .ok()
+        };
+
+        let payload_wrapper = match &encoder {
+            Some(encoder) => {
+                validate_payload_wrapper(&self.payload_prefix, &self.payload_suffix, encoder)
+                    .inspect_err(|e| errors.push(format!("payload_prefix/payload_suffix: {e}")))
+                    .ok()
+            }
+            None if needs_external_file => {
+                Some((self.payload_prefix.clone(), self.payload_suffix.clone()))
+            }
+            None => None,
+        };
+
+        match (
+            errors.is_empty(),
+            batch_settings,
+            uri,
+            static_headers,
+            template_headers,
+            payload_wrapper,
+        ) {
+            (
+                true,
+                Some(batch_settings),
+                Some(uri),
+                Some(static_headers),
+                Some(template_headers),
+                Some((payload_prefix, payload_suffix)),
+            ) => Ok(ValidatedHttpSink {
+                batch_settings,
+                encoder,
+                payload_prefix,
+                payload_suffix,
+                static_headers,
+                template_headers,
+                uri,
+            }),
+            _ => Err(errors),
+        }
+    }
+}
+
 #[async_trait]
 #[typetag::serde(name = "http")]
 impl SinkConfig for HttpSinkConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        self.build_with_component_type(cx, Self::NAME).await
+        let validated = self.validate().map_err(|errors| errors.join("; "))?;
+        self.build_with_component_type(cx, Self::NAME, validated)
+            .await
     }
 
     fn confinement_config(&self) -> Option<&crate::template::ConfinementConfig> {
@@ -270,142 +449,35 @@ impl SinkConfig for HttpSinkConfig {
     }
 
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        // Validate batch settings (max_events, max_bytes, timeout_secs)
-        if let Err(e) = self.batch.validate() {
-            errors.push(format!("batch: {e}"));
-        }
-
-        // Validate URI confinement
-        if let Err(e) = self
-            .uri
-            .clone()
-            .confine(&self.confinement, Self::NAME, "uri")
-        {
-            errors.push(e.to_string());
-        }
-
-        // Validate static URIs can be parsed and check for duplicate credentials
-        if !self.uri.is_dynamic() {
-            // Parse as UriSerde to extract any embedded auth
-            match self.uri.get_ref().parse::<UriSerde>() {
-                Ok(uri_serde) => {
-                    // Check that static URI has scheme and host
-                    let scheme = uri_serde.uri.scheme();
-                    if scheme.is_none() {
-                        errors.push("uri: must include a scheme (http:// or https://)".to_string());
-                    }
-                    if let Some(s) = scheme
-                        && s != "http"
-                        && s != "https"
-                    {
-                        errors.push(format!("uri: scheme must be http or https, got '{}'", s));
-                    }
-                    if uri_serde.uri.host().is_none() {
-                        errors.push("uri: must include a host".to_string());
-                    }
-                    // Check for duplicate credentials (auth in URI + auth in config)
-                    if let Err(e) = self.auth.choose_one(&uri_serde.auth) {
-                        errors.push(format!("auth: {e}"));
-                    }
-                }
-                Err(e) => {
-                    errors.push(format!("uri: invalid URI: {e}"));
-                }
-            }
-        } else {
-            // For dynamic URIs, check if the static prefix contains embedded auth
-            // This would conflict with top-level auth on every render
-            let uri_str = self.uri.get_ref();
-            // Parse the authority part only (between :// and /)
-            // Use split to avoid UTF-8 slicing issues
-            if let Some(after_scheme) = uri_str.split("://").nth(1) {
-                let authority = after_scheme.split('/').next().unwrap_or("");
-                // Check for embedded credentials (user:pass@host)
-                if authority.contains('@') && self.auth.is_some() {
-                    errors.push(
-                        "uri: contains embedded credentials that conflict with `auth`. Remove credentials from the URI or remove `auth`.".to_string()
-                    );
-                }
-            }
-        }
-
-        // Validate headers (both static and template values)
-        if let Err(e) = validate_headers(&self.request.headers, self.auth.is_some()) {
-            errors.push(format!("request.headers: {e}"));
-        }
-
-        // Validate header value templates confinement
-        // split_headers() returns (static_headers, template_headers)
-        let (_, template_headers) = self.request.split_headers();
-        for (name, tpl) in template_headers.into_iter() {
-            if let Err(e) = tpl.confine(&self.confinement, Self::NAME, "request.headers") {
-                errors.push(format!("headers.{}: {}", name, e));
-            }
-        }
-
-        // Validate encoding configuration (structural checks only, no I/O)
-        if let Err(e) = self.encoding.validate_structure() {
-            errors.push(format!("encoding: {e}"));
-        }
-
-        // Validate payload wrapper for JSON encoding with comma-delimited framing
-        // This requires building the encoder, but skip for encodings that need external files
-        // as those would perform I/O (validate_structure should not access the environment)
-        let serializer = self.encoding.config().1;
-        let needs_external_file = matches!(
-            serializer,
-            vector_lib::codecs::encoding::SerializerConfig::Protobuf(_)
-        );
-
-        if !needs_external_file {
-            match self.build_encoder() {
-                Ok(encoder) => {
-                    if let Err(e) = validate_payload_wrapper(
-                        &self.payload_prefix,
-                        &self.payload_suffix,
-                        &encoder,
-                    ) {
-                        errors.push(format!("payload_prefix/payload_suffix: {e}"));
-                    }
-                }
-                Err(e) => {
-                    errors.push(format!("encoding: {e}"));
-                }
-            }
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
+        self.validate().map(|_| ())
     }
 }
 
 impl HttpSinkConfig {
-    /// Confinement + sink construction. `component_name` is threaded through so
-    /// per-template security warnings carry the outer sink type — `http` when
-    /// this is the top-level sink, `opentelemetry` when
-    /// [`OpenTelemetryConfig::build`] delegates here.
+    /// Sink construction from values derived by validation. `component_name` is kept alongside the
+    /// corresponding validator so wrapper sinks can preserve their component type in confinement
+    /// diagnostics.
     pub(crate) async fn build_with_component_type(
         &self,
         cx: SinkContext,
-        component_name: &'static str,
+        _component_name: &'static str,
+        validated: ValidatedHttpSink,
     ) -> crate::Result<(VectorSink, Healthcheck)> {
-        let batch_settings = self.batch.validate()?.into_batcher_settings()?;
+        let ValidatedHttpSink {
+            batch_settings,
+            encoder,
+            payload_prefix,
+            payload_suffix,
+            static_headers,
+            template_headers,
+            uri,
+        } = validated;
 
-        let encoder = self.build_encoder()?;
+        let encoder = match encoder {
+            Some(encoder) => encoder,
+            None => self.build_encoder()?,
+        };
         let transformer = self.encoding.transformer();
-
-        let request = self.request.clone();
-
-        validate_headers(&request.headers, self.auth.is_some())?;
-        let (static_headers, template_headers) = request.split_headers();
-
-        let (payload_prefix, payload_suffix) =
-            validate_payload_wrapper(&self.payload_prefix, &self.payload_suffix, &encoder)?;
 
         let client = self.build_http_client(&cx)?;
 
@@ -443,20 +515,10 @@ impl HttpSinkConfig {
                 .to_string()
         });
 
-        let converted_static_headers = static_headers
-            .into_iter()
-            .map(|(name, value)| -> crate::Result<_> {
-                let header_name =
-                    HeaderName::from_bytes(name.as_bytes()).map(OrderedHeaderName::from)?;
-                let header_value = HeaderValue::try_from(value)?;
-                Ok((header_name, header_value))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-
         let http_sink_request_builder = HttpSinkRequestBuilder::new(
             self.method,
             self.auth.clone(),
-            converted_static_headers,
+            static_headers,
             content_type,
             content_encoding,
         );
@@ -499,23 +561,6 @@ impl HttpSinkConfig {
                 http_response_retry_logic(self.retry_strategy.clone()),
             )
             .service(service);
-
-        let uri = self
-            .uri
-            .clone()
-            .confine(&self.confinement, component_name, "uri")?;
-
-        // Confine every templated header value. Header-based routing
-        // (e.g. `X-Scope-OrgID: "{{ tenant }}"`) is as steerable as URI
-        // routing — an event that controls the header field picks the
-        // destination tenant unless we confine the header template too.
-        let template_headers = template_headers
-            .into_iter()
-            .map(|(name, tpl)| {
-                tpl.confine(&self.confinement, component_name, "request.headers")
-                    .map(|tpl| (name, tpl))
-            })
-            .collect::<crate::Result<BTreeMap<_, _>>>()?;
 
         let sink = HttpSink::new(
             service,
@@ -594,6 +639,68 @@ mod tests {
     }
 
     register_validatable_component!(HttpSinkConfig);
+
+    #[test]
+    fn validate_yields_confined_uri_headers_and_encoder() {
+        use crate::event::Event;
+        use vector_lib::event::LogEvent;
+        use vrl::event_path;
+
+        let mut headers = BTreeMap::new();
+        headers.insert("X-Static".to_string(), "static".to_string());
+        headers.insert("X-Tenant".to_string(), "tenant-{{ tenant }}".to_string());
+
+        let config = HttpSinkConfig {
+            uri: Template::try_from("https://example.com/ingest/{{ path }}").unwrap(),
+            method: HttpMethod::default(),
+            encoding: EncodingConfigWithFraming::new(
+                None,
+                JsonSerializerConfig::new(MetricTagValues::Full, JsonSerializerOptions::default())
+                    .into(),
+                Transformer::default(),
+            ),
+            auth: None,
+            compression: Compression::default(),
+            batch: BatchConfig::default(),
+            request: RequestConfig {
+                headers,
+                ..Default::default()
+            },
+            tls: None,
+            acknowledgements: AcknowledgementsConfig::default(),
+            payload_prefix: String::new(),
+            payload_suffix: String::new(),
+            retry_strategy: RetryStrategy::default(),
+            confinement: ConfinementConfig::default(),
+        };
+
+        let validated = config.validate().unwrap();
+        assert!(validated.encoder.is_some());
+        assert!(
+            validated
+                .static_headers
+                .keys()
+                .any(|name| name.inner().as_str() == "x-static")
+        );
+
+        let mut event = Event::Log(LogEvent::from("test"));
+        event.as_mut_log().insert(event_path!("path"), "ok");
+        event.as_mut_log().insert(event_path!("tenant"), "acme");
+
+        assert_eq!(
+            validated.uri.render_string(&event).unwrap(),
+            "https://example.com/ingest/ok"
+        );
+        assert_eq!(
+            validated
+                .template_headers
+                .get("X-Tenant")
+                .unwrap()
+                .render_string(&event)
+                .unwrap(),
+            "tenant-acme"
+        );
+    }
 
     #[test]
     fn confinement_rejects_unconfined_uri() {

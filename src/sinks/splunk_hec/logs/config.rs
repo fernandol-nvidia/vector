@@ -188,35 +188,89 @@ impl GenerateConfig for HecLogsSinkConfig {
     }
 }
 
+/// Values derived while validating [`HecLogsSinkConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain the confined templates and batch settings the
+/// sink renders with is [`ValidateSink::validate`] or the component-type-aware helper used by
+/// wrapping sinks.
+#[derive(Debug)]
+pub struct ValidatedHecLogsSink {
+    sourcetype: Option<ConfinedTemplate>,
+    source: Option<ConfinedTemplate>,
+    index: Option<ConfinedTemplate>,
+    batch_settings: BatcherSettings,
+}
+
 impl HecLogsSinkConfig {
-    /// Confinement + sink construction. `component_name` is threaded into the
-    /// per-template security warnings emitted from `Template::confine`, so
-    /// wrapping sinks (Humio) see their own type in logs rather than the
-    /// delegated `splunk_hec_logs`.
-    pub(crate) fn build_with_component_type(
+    pub(crate) fn validate_with_component_type(
         &self,
-        cx: SinkContext,
         component_name: &'static str,
-    ) -> crate::Result<(VectorSink, Healthcheck)> {
+    ) -> std::result::Result<ValidatedHecLogsSink, Vec<String>> {
+        let mut errors = Vec::new();
+
         if self.auto_extract_timestamp.is_some() && self.endpoint_target == EndpointTarget::Raw {
-            return Err("`auto_extract_timestamp` cannot be set for the `raw` endpoint.".into());
+            errors
+                .push("`auto_extract_timestamp` cannot be set for the `raw` endpoint.".to_string());
         }
 
         let index = self
             .index
             .clone()
             .map(|t| t.confine(&self.confinement, component_name, "index"))
-            .transpose()?;
+            .transpose()
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
         let source = self
             .source
             .clone()
             .map(|t| t.confine(&self.confinement, component_name, "source"))
-            .transpose()?;
+            .transpose()
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
         let sourcetype = self
             .sourcetype
             .clone()
             .map(|t| t.confine(&self.confinement, component_name, "sourcetype"))
-            .transpose()?;
+            .transpose()
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
+        let batch_settings = self
+            .batch
+            .into_batcher_settings()
+            .inspect_err(|e| errors.push(format!("batch: {e}")))
+            .ok();
+
+        // Structural checks only, no I/O: this validates the `message_type` format for Protobuf
+        // without reading the descriptor file.
+        if let Err(e) = self.encoding.validate_structure() {
+            errors.push(format!("encoding: {e}"));
+        }
+
+        match (errors.is_empty(), sourcetype, source, index, batch_settings) {
+            (true, Some(sourcetype), Some(source), Some(index), Some(batch_settings)) => {
+                Ok(ValidatedHecLogsSink {
+                    sourcetype,
+                    source,
+                    index,
+                    batch_settings,
+                })
+            }
+            _ => Err(errors),
+        }
+    }
+
+    pub(crate) fn build_with_validated(
+        &self,
+        cx: SinkContext,
+        validated: ValidatedHecLogsSink,
+    ) -> crate::Result<(VectorSink, Healthcheck)> {
+        let ValidatedHecLogsSink {
+            sourcetype,
+            source,
+            index,
+            batch_settings,
+        } = validated;
 
         let client = create_client(self.tls.as_ref(), cx.proxy())?;
         let healthcheck = build_healthcheck(
@@ -225,9 +279,17 @@ impl HecLogsSinkConfig {
             client.clone(),
         )
         .boxed();
-        let sink = self.build_processor(client, cx, sourcetype, source, index)?;
+        let sink = self.build_processor(client, cx, sourcetype, source, index, batch_settings)?;
 
         Ok((sink, healthcheck))
+    }
+}
+
+impl ValidateSink for HecLogsSinkConfig {
+    type Validated = ValidatedHecLogsSink;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        self.validate_with_component_type(Self::NAME)
     }
 }
 
@@ -235,7 +297,8 @@ impl HecLogsSinkConfig {
 #[typetag::serde(name = "splunk_hec_logs")]
 impl SinkConfig for HecLogsSinkConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        self.build_with_component_type(cx, Self::NAME)
+        let validated = self.validate().map_err(|errors| errors.join("; "))?;
+        self.build_with_validated(cx, validated)
     }
 
     fn confinement_config(&self) -> Option<&crate::template::ConfinementConfig> {
@@ -251,47 +314,7 @@ impl SinkConfig for HecLogsSinkConfig {
     }
 
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        // Validate raw endpoint incompatibility with auto_extract_timestamp
-        if self.auto_extract_timestamp.is_some() && self.endpoint_target == EndpointTarget::Raw {
-            errors
-                .push("`auto_extract_timestamp` cannot be set for the `raw` endpoint.".to_string());
-        }
-
-        if let Some(index) = self.index.clone()
-            && let Err(e) = index.confine(&self.confinement, Self::NAME, "index")
-        {
-            errors.push(e.to_string());
-        }
-
-        if let Some(source) = self.source.clone()
-            && let Err(e) = source.confine(&self.confinement, Self::NAME, "source")
-        {
-            errors.push(e.to_string());
-        }
-
-        if let Some(sourcetype) = self.sourcetype.clone()
-            && let Err(e) = sourcetype.confine(&self.confinement, Self::NAME, "sourcetype")
-        {
-            errors.push(e.to_string());
-        }
-
-        // Validate batch settings (mirrors build_processor's into_batcher_settings call)
-        if let Err(e) = self.batch.into_batcher_settings() {
-            errors.push(format!("batch: {e}"));
-        }
-
-        // Validate encoding configuration (structural checks only, no I/O)
-        if let Err(e) = self.encoding.validate_structure() {
-            errors.push(format!("encoding: {e}"));
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
+        self.validate().map(|_| ())
     }
 }
 
@@ -303,6 +326,7 @@ impl HecLogsSinkConfig {
         sourcetype: Option<ConfinedTemplate>,
         source: Option<ConfinedTemplate>,
         index: Option<ConfinedTemplate>,
+        batch_settings: BatcherSettings,
     ) -> crate::Result<VectorSink> {
         let ack_client = if self.acknowledgements.indexer_acknowledgements_enabled {
             Some(client.clone())
@@ -346,8 +370,6 @@ impl HecLogsSinkConfig {
             self.acknowledgements.clone(),
         );
 
-        let batch_settings = self.batch.into_batcher_settings()?;
-
         let sink = HecLogsSink {
             service,
             request_builder,
@@ -379,8 +401,12 @@ mod tests {
     };
 
     use super::*;
-    use crate::components::validation::prelude::*;
     use crate::template::{ConfinementConfig, Template};
+    use crate::{
+        components::validation::prelude::*,
+        event::{Event, LogEvent},
+    };
+    use vrl::event_path;
 
     #[test]
     fn generate_config() {
@@ -473,6 +499,65 @@ mod tests {
         };
 
         config.validate_structure().unwrap();
+    }
+
+    #[test]
+    fn validate_yields_confined_templates_and_batch_settings() {
+        let config = HecLogsSinkConfig {
+            default_token: SensitiveString::from("test-token".to_string()),
+            endpoint: "http://localhost:8088".to_string(),
+            host_key: None,
+            indexed_fields: vec![],
+            index: Some(Template::try_from("index-{{ env }}").unwrap()),
+            sourcetype: Some(Template::try_from("type-{{ env }}").unwrap()),
+            source: Some(Template::try_from("source-{{ env }}").unwrap()),
+            encoding: TextSerializerConfig::default().into(),
+            compression: Compression::default(),
+            batch: BatchConfig::default(),
+            request: TowerRequestConfig::default(),
+            tls: None,
+            acknowledgements: Default::default(),
+            timestamp_nanos_key: None,
+            timestamp_key: None,
+            auto_extract_timestamp: None,
+            endpoint_target: EndpointTarget::Event,
+            confinement: ConfinementConfig::default(),
+        };
+
+        let validated = config.validate().expect("config is valid");
+
+        let mut event = LogEvent::from_str_legacy("message");
+        event.insert(event_path!("env"), "prod");
+        let event = Event::from(event);
+
+        assert_eq!(
+            validated
+                .index
+                .as_ref()
+                .unwrap()
+                .render_string(&event)
+                .unwrap(),
+            "index-prod"
+        );
+        assert_eq!(
+            validated
+                .sourcetype
+                .as_ref()
+                .unwrap()
+                .render_string(&event)
+                .unwrap(),
+            "type-prod"
+        );
+        assert_eq!(
+            validated
+                .source
+                .as_ref()
+                .unwrap()
+                .render_string(&event)
+                .unwrap(),
+            "source-prod"
+        );
+        assert!(validated.batch_settings.item_limit > 0);
     }
 
     impl ValidatableComponent for HecLogsSinkConfig {

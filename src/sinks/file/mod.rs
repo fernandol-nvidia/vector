@@ -30,7 +30,9 @@ use vector_lib::{
 
 use crate::{
     codecs::{Encoder, EncodingConfigWithFraming, SinkType, Transformer},
-    config::{AcknowledgementsConfig, GenerateConfig, Input, SinkConfig, SinkContext},
+    config::{
+        AcknowledgementsConfig, GenerateConfig, Input, SinkConfig, SinkContext, ValidateSink,
+    },
     event::{Event, EventStatus, Finalizable},
     expiring_hash_map::ExpiringHashMap,
     internal_events::{
@@ -39,7 +41,7 @@ use crate::{
     },
     sinks::util::{
         StreamSink,
-        path_confinement::{ConfineError, PathConfinement},
+        path_confinement::{BuildError, ConfineError, PathConfinement},
         timezone_to_offset,
     },
     template::{ConfinementConfig, UnconfinedTemplate},
@@ -240,14 +242,71 @@ impl OutFile {
     }
 }
 
+/// Values derived while validating [`FileSinkConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain the path confinement the sink renders with
+/// is [`ValidateSink::validate`].
+#[derive(Debug)]
+pub struct ValidatedFileSink {
+    confinement: Option<PathConfinement>,
+}
+
+impl ValidateSink for FileSinkConfig {
+    type Validated = ValidatedFileSink;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        let mut errors = Vec::new();
+
+        let base_not_absolute = self
+            .base_dir
+            .as_ref()
+            .filter(|base| base.is_relative())
+            .cloned();
+        if let Some(base) = &base_not_absolute {
+            errors.push(BuildError::BaseNotAbsolute { path: base.clone() }.to_string());
+        }
+
+        let confinement = if self
+            .confinement
+            .dangerously_allow_unconfined_template_resolution
+        {
+            Some(None)
+        } else if base_not_absolute.is_some() {
+            None
+        } else {
+            PathConfinement::for_template(&self.path, self.base_dir.as_deref())
+                .inspect_err(|e| errors.push(e.to_string()))
+                .ok()
+        };
+
+        // Validate encoding configuration (structural checks only, no I/O)
+        // This checks message_type format for Protobuf without reading the descriptor file.
+        if let Err(e) = self.encoding.validate_structure() {
+            errors.push(format!("encoding: {}", e));
+        }
+
+        match (errors.is_empty(), confinement) {
+            (true, Some(confinement)) => Ok(ValidatedFileSink { confinement }),
+            _ => Err(errors),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 #[typetag::serde(name = "file")]
 impl SinkConfig for FileSinkConfig {
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        self.validate().map(|_| ())
+    }
+
     async fn build(
         &self,
         cx: SinkContext,
     ) -> crate::Result<(super::VectorSink, super::Healthcheck)> {
-        let sink = FileSink::new(self, cx)?;
+        let ValidatedFileSink { confinement } =
+            self.validate().map_err(|errors| errors.join("; "))?;
+
+        let sink = FileSink::new_validated(self, cx, confinement)?;
         Ok((
             super::VectorSink::from_event_streamsink(sink),
             future::ok(()).boxed(),
@@ -264,38 +323,6 @@ impl SinkConfig for FileSinkConfig {
 
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
-    }
-
-    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        // Validate base_dir is absolute if present
-        if let Some(base) = self.base_dir.as_ref()
-            && base.is_relative()
-        {
-            errors.push(format!("base_dir must be an absolute path, got {:?}", base));
-        }
-
-        // Validate path confinement (unless opted out)
-        if !self
-            .confinement
-            .dangerously_allow_unconfined_template_resolution
-            && let Err(e) = PathConfinement::for_template(&self.path, self.base_dir.as_deref())
-        {
-            errors.push(e.to_string());
-        }
-
-        // Validate encoding configuration (structural checks only, no I/O)
-        // This checks message_type format for Protobuf without reading the descriptor file.
-        if let Err(e) = self.encoding.validate_structure() {
-            errors.push(format!("encoding: {}", e));
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
     }
 }
 
@@ -314,6 +341,17 @@ pub struct FileSink {
 
 impl FileSink {
     pub fn new(config: &FileSinkConfig, cx: SinkContext) -> crate::Result<Self> {
+        let ValidatedFileSink { confinement } =
+            config.validate().map_err(|errors| errors.join("; "))?;
+
+        Self::new_validated(config, cx, confinement)
+    }
+
+    fn new_validated(
+        config: &FileSinkConfig,
+        cx: SinkContext,
+        confinement: Option<PathConfinement>,
+    ) -> crate::Result<Self> {
         let transformer = config.encoding.transformer();
         let (framer, serializer) = config.encoding.build(SinkType::StreamBased)?;
         let encoder = Encoder::<Framer>::new(framer, serializer);
@@ -323,28 +361,12 @@ impl FileSink {
             .or(cx.globals.timezone)
             .and_then(timezone_to_offset);
 
-        // Config validation runs regardless of the opt-out: a relative
-        // `base_dir` is a syntactic error, not a confinement decision.
-        if let Some(base) = config.base_dir.as_ref()
-            && base.is_relative()
-        {
-            return Err(Box::new(
-                crate::sinks::util::path_confinement::BuildError::BaseNotAbsolute {
-                    path: base.clone(),
-                },
-            ));
-        }
-
-        let confinement = if config
+        if config
             .confinement
             .dangerously_allow_unconfined_template_resolution
         {
             ConfinementConfig::warn_unconfined_template("sink", "file", "path");
-            None
-        } else {
-            PathConfinement::for_template(&config.path, config.base_dir.as_deref())
-                .map_err(Box::new)?
-        };
+        }
 
         Ok(Self {
             path: config.path.clone().with_tz_offset(offset),
@@ -1192,6 +1214,21 @@ mod tests {
             base_dir: None,
             confinement: ConfinementConfig::default(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_yields_path_confinement() {
+        let dir = temp_dir();
+        let path = format!("{}/{{{{ key }}}}.log", dir.display());
+        let config = base_config(&path);
+
+        let validated = config.validate().expect("config is valid");
+        let confinement = validated
+            .confinement
+            .expect("dynamic path should be confined");
+
+        assert_eq!(confinement.base_dir(), dir.as_path());
     }
 
     // Uses Unix-shaped `/` absolute paths in test fixtures. On Windows those

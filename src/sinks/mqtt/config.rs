@@ -112,14 +112,61 @@ impl Default for MqttSinkConfig {
 
 impl_generate_config_from_default!(MqttSinkConfig);
 
+/// Values derived while validating [`MqttSinkConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain the confined template the sink renders with
+/// is [`ValidateSink::validate`].
+#[derive(Debug)]
+pub struct ValidatedMqttSink {
+    topic: ConfinedTemplate,
+}
+
+impl ValidateSink for MqttSinkConfig {
+    type Validated = ValidatedMqttSink;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        let mut errors = Vec::new();
+
+        // Check for empty client_id
+        if let Some(client_id) = &self.common.client_id
+            && client_id.is_empty()
+        {
+            errors.push("client_id cannot be empty".to_string());
+        }
+
+        // Check for invalid credentials (only one of user/password set)
+        match (&self.common.user, &self.common.password) {
+            (Some(_), None) | (None, Some(_)) => {
+                errors.push("both user and password must be set together".to_string());
+            }
+            _ => {}
+        }
+
+        let topic = self
+            .topic
+            .clone()
+            .confine(&self.confinement, Self::NAME, "topic")
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
+        // Validate encoding configuration (structural checks only, no I/O)
+        if let Err(e) = self.encoding.validate_structure() {
+            errors.push(format!("encoding: {}", e));
+        }
+
+        match (errors.is_empty(), topic) {
+            (true, Some(topic)) => Ok(ValidatedMqttSink { topic }),
+            _ => Err(errors),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 #[typetag::serde(name = "mqtt")]
 impl SinkConfig for MqttSinkConfig {
     async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let topic = self
-            .topic
-            .clone()
-            .confine(&self.confinement, Self::NAME, "topic")?;
+        let ValidatedMqttSink { topic } = self.validate().map_err(|errors| errors.join("; "))?;
+
         let connector = self.build_connector()?;
         let sink = MqttSink::new(self, topic, connector.clone())?;
         Ok((
@@ -141,41 +188,7 @@ impl SinkConfig for MqttSinkConfig {
     }
 
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        // Check for empty client_id
-        if let Some(client_id) = &self.common.client_id
-            && client_id.is_empty()
-        {
-            errors.push("client_id cannot be empty".to_string());
-        }
-
-        // Check for invalid credentials (only one of user/password set)
-        match (&self.common.user, &self.common.password) {
-            (Some(_), None) | (None, Some(_)) => {
-                errors.push("both user and password must be set together".to_string());
-            }
-            _ => {}
-        }
-
-        if let Err(e) = self
-            .topic
-            .clone()
-            .confine(&self.confinement, Self::NAME, "topic")
-        {
-            errors.push(e.to_string());
-        }
-
-        // Validate encoding configuration (structural checks only, no I/O)
-        if let Err(e) = self.encoding.validate_structure() {
-            errors.push(format!("encoding: {}", e));
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
+        self.validate().map(|_| ())
     }
 }
 
@@ -237,6 +250,7 @@ impl MqttSinkConfig {
 mod test {
     use super::*;
     use crate::template::{ConfinementConfig, Template};
+    use vrl::event_path;
 
     #[test]
     fn generate_config() {
@@ -267,6 +281,25 @@ mod test {
         let config = ConfinementConfig::default();
         let result = template.confine(&config, "mqtt", "topic");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_yields_confined_topic() {
+        let config = MqttSinkConfig {
+            topic: Template::try_from("events-{{ env }}").unwrap(),
+            ..MqttSinkConfig::default()
+        };
+
+        let validated = config.validate().expect("config is valid");
+
+        let mut event = LogEvent::from_str_legacy("message");
+        event.insert(event_path!("env"), "prod");
+        let event = Event::from(event);
+
+        assert_eq!(
+            validated.topic.render_string(&event).unwrap(),
+            "events-prod"
+        );
     }
 
     #[test]

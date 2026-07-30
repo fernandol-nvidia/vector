@@ -131,19 +131,71 @@ impl GenerateConfig for AmqpSinkConfig {
     }
 }
 
-#[async_trait::async_trait]
-#[typetag::serde(name = "amqp")]
-impl SinkConfig for AmqpSinkConfig {
-    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+/// Values derived while validating [`AmqpSinkConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain the confined templates the sink renders with
+/// is [`ValidateSink::validate`].
+#[derive(Debug)]
+pub struct ValidatedAmqpSink {
+    exchange: ConfinedTemplate,
+    routing_key: Option<ConfinedTemplate>,
+}
+
+impl ValidateSink for AmqpSinkConfig {
+    type Validated = ValidatedAmqpSink;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        let mut errors = Vec::new();
+
+        // Mirrors the pool precondition in `channel::new_channel_pool`.
+        if self.max_channels == 0 {
+            errors.push("max_channels must be positive".to_string());
+        }
+
+        // Structural checks only, no I/O: this validates the `message_type` format for Protobuf
+        // without reading the descriptor file.
+        if let Err(e) = self.encoding.validate_structure() {
+            errors.push(format!("encoding: {e}"));
+        }
+
         let exchange = self
             .exchange
             .clone()
-            .confine(&self.confinement, Self::NAME, "exchange")?;
+            .confine(&self.confinement, Self::NAME, "exchange")
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
         let routing_key = self
             .routing_key
             .clone()
             .map(|t| t.confine(&self.confinement, Self::NAME, "routing_key"))
-            .transpose()?;
+            .transpose()
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
+        match (errors.is_empty(), exchange, routing_key) {
+            (true, Some(exchange), Some(routing_key)) => Ok(ValidatedAmqpSink {
+                exchange,
+                routing_key,
+            }),
+            _ => Err(errors),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+#[typetag::serde(name = "amqp")]
+impl SinkConfig for AmqpSinkConfig {
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        self.validate().map(|_| ())
+    }
+
+    async fn build(&self, _cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        let ValidatedAmqpSink {
+            exchange,
+            routing_key,
+        } = self.validate().map_err(|errors| errors.join("; "))?;
+
         let sink = AmqpSink::new(self.clone(), exchange, routing_key).await?;
         let hc = healthcheck(sink.channels.clone()).boxed();
         Ok((VectorSink::from_event_streamsink(sink), hc))
@@ -159,41 +211,6 @@ impl SinkConfig for AmqpSinkConfig {
 
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
-    }
-
-    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        // Validate max_channels is positive (mirrors new_channel_pool check)
-        if self.max_channels == 0 {
-            errors.push("max_channels must be positive".to_string());
-        }
-
-        // Validate encoding configuration (structural checks only, no I/O)
-        // This checks message_type format for Protobuf without reading the descriptor file.
-        if let Err(e) = self.encoding.validate_structure() {
-            errors.push(format!("encoding: {e}"));
-        }
-
-        if let Err(e) = self
-            .exchange
-            .clone()
-            .confine(&self.confinement, Self::NAME, "exchange")
-        {
-            errors.push(e.to_string());
-        }
-
-        if let Some(routing_key) = self.routing_key.clone()
-            && let Err(e) = routing_key.confine(&self.confinement, Self::NAME, "routing_key")
-        {
-            errors.push(e.to_string());
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
     }
 }
 
@@ -380,5 +397,47 @@ mod tests {
             "unexpected error: {:?}",
             errors[0]
         );
+    }
+
+    #[test]
+    fn validate_yields_confined_templates() {
+        let config = AmqpSinkConfig {
+            exchange: Template::try_from("events-{{ env }}").unwrap(),
+            routing_key: Some(Template::try_from("key-{{ env }}").unwrap()),
+            ..AmqpSinkConfig::default()
+        };
+
+        let validated = config.validate().expect("config is valid");
+
+        let mut event = LogEvent::from_str_legacy("message");
+        event.insert(event_path!("env"), "prod");
+        let event = Event::from(event);
+
+        assert_eq!(
+            validated.exchange.render_string(&event).unwrap(),
+            "events-prod"
+        );
+        assert_eq!(
+            validated
+                .routing_key
+                .as_ref()
+                .unwrap()
+                .render_string(&event)
+                .unwrap(),
+            "key-prod"
+        );
+    }
+
+    #[test]
+    fn validate_accumulates_every_error() {
+        let config = AmqpSinkConfig {
+            max_channels: 0,
+            exchange: Template::try_from("{{ exchange }}").unwrap(),
+            routing_key: Some(Template::try_from("{{ routing_key }}").unwrap()),
+            ..AmqpSinkConfig::default()
+        };
+
+        let errors = config.validate().unwrap_err();
+        assert_eq!(errors.len(), 3, "unexpected errors: {errors:?}");
     }
 }

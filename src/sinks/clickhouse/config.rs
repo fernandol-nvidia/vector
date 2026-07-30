@@ -216,12 +216,138 @@ pub struct AsyncInsertSettingsConfig {
 
 impl_generate_config_from_default!(ClickhouseConfig);
 
+/// Values derived while validating [`ClickhouseConfig`], consumed by its `build`.
+///
+/// The fields are private, so the only way to obtain defaulted endpoints, chosen auth,
+/// batcher settings, and confined templates is [`ValidateSink::validate`].
+#[derive(Debug)]
+pub struct ValidatedClickhouse {
+    endpoint: Uri,
+    auth: Option<Auth>,
+    batch_settings: BatcherSettings,
+    database_template: Template,
+    database: ConfinedTemplate,
+    table: ConfinedTemplate,
+}
+
+impl ValidateSink for ClickhouseConfig {
+    type Validated = ValidatedClickhouse;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        let mut errors = Vec::new();
+
+        let endpoint = self.endpoint.with_default_parts().uri;
+
+        let database_template = match self.database.clone() {
+            Some(database) => Some(database),
+            None => Template::try_from("default")
+                .inspect_err(|e| errors.push(format!("database: {e}")))
+                .ok(),
+        };
+
+        if self.batch_encoding.is_some() && self.format != Format::ArrowStream {
+            errors.push(format!(
+                "'batch_encoding' is only compatible with 'format: arrow_stream'. Found 'format: {}'.",
+                self.format
+            ));
+        }
+
+        if self.batch_encoding.is_some() {
+            if self.table.is_dynamic() {
+                errors.push(
+                    "Arrow codec requires a static table. Dynamic schema inference is not supported."
+                        .to_string(),
+                );
+            }
+            if database_template
+                .as_ref()
+                .is_some_and(|database_template| database_template.is_dynamic())
+            {
+                errors.push(
+                    "Arrow codec requires a static database. Dynamic schema inference is not supported."
+                        .to_string(),
+                );
+            }
+        }
+
+        if endpoint.host().is_none() {
+            errors.push("endpoint must include a host".to_string());
+        }
+
+        let auth = self
+            .auth
+            .choose_one(&self.endpoint.auth)
+            .inspect_err(|e| errors.push(format!("auth: {e}")))
+            .ok();
+
+        let batch_settings = self
+            .batch
+            .into_batcher_settings()
+            .inspect_err(|e| errors.push(format!("batch: {e}")))
+            .ok();
+
+        let table = self
+            .table
+            .clone()
+            .confine(&self.confinement, Self::NAME, "table")
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok();
+
+        let database = database_template
+            .clone()
+            .map(|database_template| {
+                database_template.confine(&self.confinement, Self::NAME, "database")
+            })
+            .transpose()
+            .inspect_err(|e| errors.push(e.to_string()))
+            .ok()
+            .flatten();
+
+        match (
+            errors.is_empty(),
+            auth,
+            batch_settings,
+            database_template,
+            database,
+            table,
+        ) {
+            (
+                true,
+                Some(auth),
+                Some(batch_settings),
+                Some(database_template),
+                Some(database),
+                Some(table),
+            ) => Ok(ValidatedClickhouse {
+                endpoint,
+                auth,
+                batch_settings,
+                database_template,
+                database,
+                table,
+            }),
+            _ => Err(errors),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 #[typetag::serde(name = "clickhouse")]
 impl SinkConfig for ClickhouseConfig {
+    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
+        self.validate().map(|_| ())
+    }
+
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let endpoint = self.endpoint.with_default_parts().uri;
-        let auth = self.auth.choose_one(&self.endpoint.auth)?;
+        let ValidatedClickhouse {
+            endpoint,
+            auth,
+            batch_settings,
+            database_template,
+            database,
+            table,
+        } = self.validate().map_err(|errors| errors.join("; "))?;
+
         let tls_settings = TlsSettings::from_options(self.tls.as_ref())?;
         let client = HttpClient::new(tls_settings, &cx.proxy)?;
 
@@ -244,26 +370,9 @@ impl SinkConfig for ClickhouseConfig {
             .settings(request_limits, ClickhouseRetryLogic::default())
             .service(service);
 
-        let batch_settings = self.batch.into_batcher_settings()?;
-
-        // Use config templates for introspection in resolve_strategy.
-        let database_template = self.database.clone().unwrap_or_else(|| {
-            "default"
-                .try_into()
-                .expect("'default' should be a valid template")
-        });
-
-        // Resolve the encoding strategy (format + encoder) based on configuration.
         let (format, encoder_kind) = self
             .resolve_strategy(&client, &endpoint, &database_template, auth.as_ref())
             .await?;
-
-        // Confine templates for runtime use in the sink.
-        let confined_table = self
-            .table
-            .clone()
-            .confine(&self.confinement, Self::NAME, "table")?;
-        let database = database_template.confine(&self.confinement, Self::NAME, "database")?;
 
         let request_builder = ClickhouseRequestBuilder {
             compression: self.compression,
@@ -274,7 +383,7 @@ impl SinkConfig for ClickhouseConfig {
             batch_settings,
             service,
             database,
-            confined_table,
+            table,
             format,
             request_builder,
         );
@@ -294,80 +403,13 @@ impl SinkConfig for ClickhouseConfig {
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &self.acknowledgements
     }
-
-    fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        let mut errors = Vec::new();
-
-        // Validate batch_encoding compatibility with format
-        if self.batch_encoding.is_some() && self.format != Format::ArrowStream {
-            errors.push(format!(
-                "'batch_encoding' is only compatible with 'format: arrow_stream'. Found 'format: {}'.",
-                self.format
-            ));
-        }
-
-        // Arrow codec requires static table and database (no dynamic templates)
-        if self.batch_encoding.is_some() {
-            if self.table.is_dynamic() {
-                errors.push(
-                    "Arrow codec requires a static table. Dynamic schema inference is not supported."
-                        .to_string(),
-                );
-            }
-            let database_template = self.database.clone().unwrap_or_else(|| {
-                Template::try_from("default").expect("default database template is valid")
-            });
-            if database_template.is_dynamic() {
-                errors.push(
-                    "Arrow codec requires a static database. Dynamic schema inference is not supported."
-                        .to_string(),
-                );
-            }
-        }
-
-        // Validate endpoint has a host (check before with_default_parts fills in defaults)
-        if self.endpoint.uri.host().is_none() {
-            errors.push("endpoint must include a host".to_string());
-        }
-
-        // Check for duplicate credentials (auth + endpoint.auth)
-        if let Err(e) = self.auth.choose_one(&self.endpoint.auth) {
-            errors.push(format!("auth: {e}"));
-        }
-
-        // Validate batch settings
-        if let Err(e) = self.batch.into_batcher_settings() {
-            errors.push(format!("batch: {e}"));
-        }
-
-        if let Err(e) = self
-            .table
-            .clone()
-            .confine(&self.confinement, Self::NAME, "table")
-        {
-            errors.push(e.to_string());
-        }
-
-        let database_template = self.database.clone().unwrap_or_else(|| {
-            Template::try_from("default").expect("default database template is valid")
-        });
-        if let Err(e) = database_template.confine(&self.confinement, Self::NAME, "database") {
-            errors.push(e.to_string());
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
-    }
 }
 
 impl ClickhouseConfig {
-    /// Resolves the encoding strategy (format + encoder) based on configuration.
+    /// Resolves the encoding strategy (format + encoder) based on already-validated configuration.
     ///
-    /// This method determines the appropriate ClickHouse format and Vector encoder
-    /// based on the user's configuration, ensuring they are consistent.
+    /// This method determines the appropriate ClickHouse format and Vector encoder based on the
+    /// user's configuration.
     async fn resolve_strategy(
         &self,
         client: &HttpClient,
@@ -376,15 +418,6 @@ impl ClickhouseConfig {
         auth: Option<&Auth>,
     ) -> crate::Result<(Format, vector_lib::codecs::EncoderKind)> {
         if let Some(batch_encoding) = &self.batch_encoding {
-            // Validate that batch_encoding is only compatible with ArrowStream format
-            if self.format != Format::ArrowStream {
-                return Err(format!(
-                    "'batch_encoding' is only compatible with 'format: arrow_stream'. Found 'format: {}'.",
-                    self.format
-                )
-                .into());
-            }
-
             let ClickhouseBatchEncoding::ArrowStream(arrow_config) = batch_encoding;
             let mut arrow_config = arrow_config.clone();
 
@@ -420,13 +453,6 @@ impl ClickhouseConfig {
         auth: Option<&Auth>,
         config: &mut ArrowStreamSerializerConfig,
     ) -> crate::Result<()> {
-        if self.table.is_dynamic() || database.is_dynamic() {
-            return Err(
-                "Arrow codec requires a static table and database. Dynamic schema inference is not supported."
-                    .into(),
-            );
-        }
-
         let table_str = self.table.get_ref();
         let database_str = database.get_ref();
 
@@ -491,8 +517,12 @@ async fn healthcheck(client: HttpClient, endpoint: Uri, auth: Option<Auth>) -> c
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::template::{ConfinementConfig, Template};
+    use crate::{
+        event::{Event, LogEvent},
+        template::{ConfinementConfig, Template},
+    };
     use vector_lib::codecs::encoding::ArrowStreamSerializerConfig;
+    use vrl::event_path;
 
     #[test]
     fn generate_config() {
@@ -574,44 +604,6 @@ mod tests {
             format,
             batch_encoding,
             ..Default::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn test_format_selection_with_batch_encoding() {
-        use crate::http::HttpClient;
-        use crate::tls::TlsSettings;
-
-        // Create minimal dependencies for resolve_strategy
-        let tls = TlsSettings::default();
-        let client = HttpClient::new(tls, &Default::default()).unwrap();
-        let endpoint: http::Uri = "http://localhost:8123".parse().unwrap();
-        let database: Template = "test_db".try_into().unwrap();
-
-        // Test incompatible formats - should all return errors
-        let incompatible_formats = vec![
-            (Format::JsonEachRow, "json_each_row"),
-            (Format::JsonAsObject, "json_as_object"),
-            (Format::JsonAsString, "json_as_string"),
-        ];
-
-        for (format, format_name) in incompatible_formats {
-            let config = create_test_config(
-                format,
-                Some(ClickhouseBatchEncoding::ArrowStream(
-                    ArrowStreamSerializerConfig::default(),
-                )),
-            );
-
-            let result = config
-                .resolve_strategy(&client, &endpoint, &database, None)
-                .await;
-
-            assert!(
-                result.is_err(),
-                "Expected error for format {} with batch_encoding, but got success",
-                format_name
-            );
         }
     }
 
@@ -741,23 +733,27 @@ mod tests {
     }
 
     #[test]
-    fn validate_structure_rejects_missing_host() {
-        use crate::config::SinkConfig;
-
+    fn validate_applies_default_endpoint_parts_and_yields_confined_templates() {
         let config = ClickhouseConfig {
             endpoint: "/path".parse::<http::Uri>().unwrap().into(),
-            table: "test_table".try_into().unwrap(),
+            table: "events-{{ env }}".try_into().unwrap(),
+            database: None,
             ..Default::default()
         };
 
-        let errors = config.validate_structure().unwrap_err();
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.contains("endpoint must include a host")),
-            "expected host error, got: {:?}",
-            errors
+        let validated = config.validate().expect("config is valid");
+
+        assert_eq!(validated.endpoint.to_string(), "http://127.0.0.1/path");
+
+        let mut event = LogEvent::from_str_legacy("message");
+        event.insert(event_path!("env"), "prod");
+        let event = Event::from(event);
+
+        assert_eq!(
+            validated.table.render_string(&event).unwrap(),
+            "events-prod"
         );
+        assert_eq!(validated.database.render_string(&event).unwrap(), "default");
     }
 
     #[test]

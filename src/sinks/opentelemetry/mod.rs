@@ -10,10 +10,10 @@ use vector_lib::{
 
 use crate::{
     codecs::{EncodingConfigWithFraming, Transformer},
-    config::{AcknowledgementsConfig, Input, SinkConfig, SinkContext},
+    config::{AcknowledgementsConfig, Input, SinkConfig, SinkContext, ValidateSink},
     sinks::{
         Healthcheck, VectorSink,
-        http::config::{HttpMethod, HttpSinkConfig},
+        http::config::{HttpMethod, HttpSinkConfig, ValidatedHttpSink},
     },
 };
 
@@ -74,17 +74,40 @@ impl GenerateConfig for OpenTelemetryConfig {
     }
 }
 
+/// Values derived while validating [`OpenTelemetryConfig`], consumed by its `build`.
+///
+/// The field is private, so the only way to obtain the validated HTTP values OpenTelemetry
+/// delegates to is [`ValidateSink::validate`].
+#[derive(Debug)]
+pub struct ValidatedOpenTelemetry {
+    http: ValidatedHttpSink,
+}
+
+impl ValidateSink for OpenTelemetryConfig {
+    type Validated = ValidatedOpenTelemetry;
+
+    fn validate(&self) -> std::result::Result<Self::Validated, Vec<String>> {
+        match &self.protocol {
+            Protocol::Http(config) => config
+                .validate_with_component_type(Self::NAME)
+                .map(|http| ValidatedOpenTelemetry { http }),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 #[typetag::serde(name = "opentelemetry")]
 impl SinkConfig for OpenTelemetryConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        let ValidatedOpenTelemetry { http } =
+            self.validate().map_err(|errors| errors.join("; "))?;
+
         match &self.protocol {
             Protocol::Http(config) => {
                 warn_on_invalid_otlp_batching(config);
-                // Delegate to the HTTP sink, but thread through `opentelemetry`
-                // as the component type so security warnings carry the outer
-                // sink type rather than `http`.
-                config.build_with_component_type(cx, Self::NAME).await
+                // Delegate to the HTTP sink with values validated using `opentelemetry` as the
+                // component type so confinement diagnostics carry the outer sink type.
+                config.build_with_component_type(cx, Self::NAME, http).await
             }
         }
     }
@@ -108,10 +131,7 @@ impl SinkConfig for OpenTelemetryConfig {
     }
 
     fn validate_structure(&self) -> std::result::Result<(), Vec<String>> {
-        // Delegate to HTTP config validation
-        match &self.protocol {
-            Protocol::Http(config) => config.validate_structure(),
-        }
+        self.validate().map(|_| ())
     }
 }
 

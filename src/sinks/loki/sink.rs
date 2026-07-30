@@ -6,39 +6,19 @@ use tokio_util::codec::Encoder as _;
 use vrl::path::{OwnedTargetPath, parse_target_path};
 
 use super::{
-    config::{LokiConfig, OutOfOrderAction},
+    config::{LokiConfig, OutOfOrderAction, ValidatedLokiSink},
     event::{LokiBatchEncoder, LokiEvent, LokiRecord, PartitionKey},
     service::{LokiRequest, LokiRetryLogic, LokiService},
 };
 use crate::{
     common::expansion::pair_expansion,
-    http::{HttpClient, get_http_scheme_from_uri},
+    http::HttpClient,
     internal_events::{
         LokiEventUnlabeledError, LokiOutOfOrderEventDroppedError, LokiOutOfOrderEventRewritten,
         LokiTimestampNonParsableEventsDropped, SinkRequestBuildError,
     },
     sinks::{loki::event::LokiBatchEncoding, prelude::*},
-    template::ConfinementConfig,
 };
-
-/// Attach the sink's confinement config to every key and value template in a
-/// `label`-style HashMap. Fails if any template rejects confinement (used at
-/// sink build time so operators get the failure up front).
-fn confine_template_map(
-    map: HashMap<Template, Template>,
-    config: &ConfinementConfig,
-    component_name: &'static str,
-    key_field_name: &'static str,
-    value_field_name: &'static str,
-) -> crate::Result<HashMap<ConfinedTemplate, ConfinedTemplate>> {
-    map.into_iter()
-        .map(|(k, v)| {
-            let k = k.confine(config, component_name, key_field_name)?;
-            let v = v.confine(config, component_name, value_field_name)?;
-            Ok((k, v))
-        })
-        .collect()
-}
 
 #[derive(Clone)]
 pub struct KeyPartitioner(Option<ConfinedTemplate>);
@@ -496,8 +476,14 @@ pub struct LokiSink {
 
 impl LokiSink {
     #[allow(clippy::missing_const_for_fn)] // const cannot run destructor
-    pub fn new(config: LokiConfig, client: HttpClient) -> crate::Result<Self> {
+    pub fn new(
+        config: LokiConfig,
+        client: HttpClient,
+        validated: ValidatedLokiSink,
+    ) -> crate::Result<Self> {
         let compression = config.compression;
+        let (tenant_id, labels, structured_metadata, batch_settings, protocol) =
+            validated.into_sink_parts();
 
         // if Vector is configured to allow events with out of order timestamps, then we can
         // safely enable concurrency settings.
@@ -516,7 +502,6 @@ impl LokiSink {
             }
         };
 
-        let protocol = get_http_scheme_from_uri(&config.endpoint.uri);
         let service = tower::ServiceBuilder::new()
             .settings(request_limits, LokiRetryLogic)
             .service(LokiService::new(
@@ -534,26 +519,6 @@ impl LokiSink {
             _ => LokiBatchEncoder(LokiBatchEncoding::Json),
         };
 
-        let tenant_id = config
-            .tenant_id
-            .map(|template| template.confine(&config.confinement, LokiConfig::NAME, "tenant_id"))
-            .transpose()?;
-
-        let labels = confine_template_map(
-            config.labels,
-            &config.confinement,
-            LokiConfig::NAME,
-            "labels[key]",
-            "labels[value]",
-        )?;
-        let structured_metadata = confine_template_map(
-            config.structured_metadata,
-            &config.confinement,
-            LokiConfig::NAME,
-            "structured_metadata[key]",
-            "structured_metadata[value]",
-        )?;
-
         Ok(Self {
             request_builder: LokiRequestBuilder {
                 compression,
@@ -569,7 +534,7 @@ impl LokiSink {
                 remove_structured_metadata_fields: config.remove_structured_metadata_fields,
                 remove_timestamp: config.remove_timestamp,
             },
-            batch_settings: config.batch.into_batcher_settings()?,
+            batch_settings,
             out_of_order_action: config.out_of_order_action,
             service,
             protocol,

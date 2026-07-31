@@ -1,6 +1,6 @@
 use std::{
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, ExitStatus},
 };
 
 use anyhow::{Context, Result, bail};
@@ -64,6 +64,33 @@ impl ComposeTestLocalConfig {
             feature_flag: E2E_FEATURE_FLAG,
         }
     }
+}
+
+pub(crate) fn collect_compose_logs(
+    local_config: ComposeTestLocalConfig,
+    test_name: &str,
+    environment: &str,
+) -> Result<Option<ExitStatus>> {
+    let (test_dir, config) = ComposeTestConfig::load(local_config.directory, test_name)?;
+    let environment_config = config
+        .environments()
+        .get(environment)
+        .cloned()
+        .with_context(|| format!("Could not find environment named {environment:?}"))?;
+    let network_name = format!("vector-integration-tests-{test_name}");
+    let Some(compose) = Compose::new(test_dir, environment_config.clone(), network_name)? else {
+        return Ok(None);
+    };
+
+    let project_name = format!(
+        "vector-{}-{}-{}",
+        local_config.directory,
+        test_name,
+        environment.replace('.', "-")
+    );
+    let environment_config = rename_environment_keys(&environment_config);
+
+    compose.logs(&environment_config, &project_name).map(Some)
 }
 
 #[derive(Debug)]
@@ -352,34 +379,40 @@ impl Compose {
         environment: Option<&Environment>,
         project_name: &str,
     ) -> Result<()> {
-        let mut command = Command::new(CONTAINER_TOOL.clone());
-        command.arg("compose");
-        command.arg("--project-name");
-        command.arg(project_name);
-        command.arg("--file");
-        command.arg(&self.yaml_path);
-
+        let mut command = self.command(project_name);
         command.args(args);
-
-        command.current_dir(&self.test_dir);
-
-        command.env("DOCKER_SOCKET", &*DOCKER_SOCKET);
-        command.env(NETWORK_ENV_VAR, &self.network);
-
-        // some services require this in order to build Vector
-        command.env("RUST_VERSION", RustToolchainConfig::rust_version());
-
-        for (key, value) in &self.env {
-            if let Some(value) = value {
-                command.env(key, value);
-            }
-        }
         if let Some(environment) = environment {
             command.envs(extract_present(environment));
         }
 
         waiting!("{action} service environment");
         command.check_run()
+    }
+
+    fn logs(&self, environment: &Environment, project_name: &str) -> Result<ExitStatus> {
+        let mut command = self.command(project_name);
+        command.arg("logs");
+        command.envs(extract_present(environment));
+        command
+            .status()
+            .with_context(|| "Failed to collect compose logs")
+    }
+
+    fn command(&self, project_name: &str) -> Command {
+        let mut command = Command::new(CONTAINER_TOOL.clone());
+        command.arg("compose");
+        command.arg("--project-name");
+        command.arg(project_name);
+        command.arg("--file");
+        command.arg(&self.yaml_path);
+        command.current_dir(&self.test_dir);
+        command.env("DOCKER_SOCKET", &*DOCKER_SOCKET);
+        command.env(NETWORK_ENV_VAR, &self.network);
+
+        // Some services require this in order to build Vector.
+        command.env("RUST_VERSION", RustToolchainConfig::rust_version());
+        command.envs(extract_present(&self.env));
+        command
     }
 }
 

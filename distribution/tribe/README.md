@@ -18,15 +18,16 @@ api,sources-http_server,transforms-remap,transforms-filter,sinks-http
 
 ## Trigger
 
-From the `tribe/release-ci` branch:
+From `master` (required for `workflow_dispatch` registration):
 
 ```sh
 gh workflow run tribe-release.yml \
-  --ref tribe/release-ci \
+  --repo fernandol-nvidia/vector \
+  --ref master \
   -f source_sha=06592198acaa966fd32277456e0fe6bbb33b3c51 \
   -f version=0.58.0-dev.06592198.tribe1 \
   -f create_release=true
 ```
 
-The release tag points at `source_sha` (never at this CI branch tip). Do not
-retag or overwrite assets after publish.
+The release tag points at `source_sha` (never at `master`). Do not retag or
+overwrite assets after publish.

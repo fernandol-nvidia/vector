@@ -57,6 +57,7 @@ jobs:
         with:
           ref: ${{ inputs.source_sha }}
           path: vector-src
+          fetch-depth: 0
 
       - name: Verify source SHA and buffer fix ancestry
         working-directory: vector-src
@@ -70,6 +71,10 @@ jobs:
           fi
           if [[ -n $(git status --porcelain) ]]; then
             echo "source checkout is dirty" >&2
+            exit 1
+          fi
+          if ! git cat-file -e 759cb947eb6ab9989df096c732aafe3529d53c48^{commit}; then
+            echo "required buffer-fix commit missing from history" >&2
             exit 1
           fi
           git merge-base --is-ancestor \

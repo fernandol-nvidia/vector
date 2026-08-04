@@ -1,0 +1,237 @@
+name: Tribe Release
+
+# Closed-feature Vector builds for Tribe workstation capture.
+# Supported: darwin/arm64, linux/arm64, linux/amd64.
+# Trigger from branch tribe/release-ci; release tag targets source_sha.
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Git SHA to build (Tribe SOURCE revision)
+        required: true
+        default: 06592198acaa966fd32277456e0fe6bbb33b3c51
+      version:
+        description: Tribe compatibility version / release tag
+        required: true
+        default: 0.58.0-dev.06592198.tribe1
+      create_release:
+        description: Create GitHub Release and upload assets
+        type: boolean
+        default: true
+
+env:
+  RUST_TOOLCHAIN: "1.95"
+  PROTOC_VERSION: "3.21.12"
+  FEATURES: api,sources-http_server,transforms-remap,transforms-filter,sinks-http
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.triple }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            triple: arm64-apple-darwin
+          - runner: ubuntu-24.04-arm
+            triple: aarch64-unknown-linux-gnu
+          - runner: ubuntu-24.04
+            triple: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    steps:
+      - name: Checkout release scripts
+        uses: actions/checkout@v4
+        with:
+          path: tribe-ci
+
+      - name: Checkout source SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: vector-src
+
+      - name: Verify source SHA and buffer fix ancestry
+        working-directory: vector-src
+        run: |
+          set -euo pipefail
+          got=$(git rev-parse HEAD)
+          want='${{ inputs.source_sha }}'
+          if [[ $got != "$want" ]]; then
+            echo "checked out $got, want $want" >&2
+            exit 1
+          fi
+          if [[ -n $(git status --porcelain) ]]; then
+            echo "source checkout is dirty" >&2
+            exit 1
+          fi
+          git merge-base --is-ancestor \
+            759cb947eb6ab9989df096c732aafe3529d53c48 HEAD
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+          cargo --version
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config libssl-dev
+
+      - name: Install protoc ${{ env.PROTOC_VERSION }}
+        working-directory: vector-src
+        run: |
+          set -euo pipefail
+          protoc_root="${{ runner.temp }}/protoc"
+          rm -rf "$protoc_root"
+          mkdir -p "$protoc_root"
+          bash scripts/environment/install-protoc.sh "$protoc_root"
+          echo "$protoc_root" >>"$GITHUB_PATH"
+          echo "PROTOC=$protoc_root/protoc" >>"$GITHUB_ENV"
+          "$protoc_root/protoc" --version
+          test "$("$protoc_root/protoc" --version)" = "libprotoc $PROTOC_VERSION"
+
+      - name: Vendor crates and build closed-feature Vector
+        working-directory: vector-src
+        run: |
+          set -euo pipefail
+          build_root="${{ runner.temp }}/tribe-vector-build"
+          cargo_home="$build_root/cargo-home"
+          vendor_root="$build_root/vendor"
+          target_root="$build_root/target"
+          rm -rf "$build_root"
+          mkdir -p "$cargo_home" "$vendor_root" "$target_root"
+
+          CARGO_HOME="$cargo_home" cargo vendor --locked --versioned-dirs "$vendor_root" \
+            >"$cargo_home/config.toml"
+
+          CARGO_HOME="$cargo_home" \
+          CARGO_TARGET_DIR="$target_root" \
+          PROTOC="$PROTOC" \
+            cargo test \
+              --package vector-buffers \
+              --lib \
+              --frozen \
+              --offline \
+              'variants::disk_v2::tests::invariants::reader_waits_after_dropping_last_published_record' \
+              -- \
+              --exact
+
+          CARGO_HOME="$cargo_home" \
+          CARGO_TARGET_DIR="$target_root" \
+          PROTOC="$PROTOC" \
+          CFLAGS='-g0 -O3' \
+            cargo build \
+              --release \
+              --frozen \
+              --offline \
+              --no-default-features \
+              --features "$FEATURES"
+
+          install -m 0755 "$target_root/release/vector" "${{ runner.temp }}/vector"
+          "${{ runner.temp }}/vector" --version
+
+      - name: Package archive
+        run: |
+          set -euo pipefail
+          out="${{ runner.temp }}/packages"
+          mkdir -p "$out"
+          chmod +x tribe-ci/distribution/tribe/package-archive.sh
+          # Packaging reads LICENSE/README from the source checkout layout.
+          # Run with repo root = vector-src by placing the script beside it via PATH copy.
+          mkdir -p vector-src/distribution/tribe
+          cp tribe-ci/distribution/tribe/package-archive.sh vector-src/distribution/tribe/
+          chmod +x vector-src/distribution/tribe/package-archive.sh
+          vector-src/distribution/tribe/package-archive.sh \
+            "${{ runner.temp }}/vector" \
+            "${{ inputs.version }}" \
+            "${{ matrix.triple }}" \
+            "$out"
+          ls -la "$out"
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector-${{ inputs.version }}-${{ matrix.triple }}
+          path: |
+            ${{ runner.temp }}/packages/vector-${{ inputs.version }}-${{ matrix.triple }}.tar.gz
+            ${{ runner.temp }}/packages/vector-${{ inputs.version }}-${{ matrix.triple }}.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    if: ${{ inputs.create_release }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all archives
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: vector-${{ inputs.version }}-*
+          merge-multiple: false
+
+      - name: Assemble release assets
+        id: assemble
+        run: |
+          set -euo pipefail
+          version='${{ inputs.version }}'
+          mkdir -p release
+          shopt -s nullglob
+          for dir in artifacts/vector-"$version"-*; do
+            cp "$dir"/*.tar.gz release/
+            cat "$dir"/*.sha256 >>"release/vector-$version-SHA256SUMS"
+          done
+          sort -o "release/vector-$version-SHA256SUMS" "release/vector-$version-SHA256SUMS"
+          echo "assets:" 
+          ls -la release/
+          echo "SHA256SUMS:"
+          cat "release/vector-$version-SHA256SUMS"
+          count=$(find release -name '*.tar.gz' | wc -l | tr -d ' ')
+          if [[ $count -ne 3 ]]; then
+            echo "expected 3 archives, found $count" >&2
+            exit 1
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version='${{ inputs.version }}'
+          source_sha='${{ inputs.source_sha }}'
+          if gh release view "$version" >/dev/null 2>&1; then
+            echo "release $version already exists; refusing to mutate" >&2
+            exit 1
+          fi
+          gh release create "$version" \
+            --repo "${{ github.repository }}" \
+            --target "$source_sha" \
+            --title "Tribe Vector $version" \
+            --notes "$(cat <<EOF
+          Closed-feature Tribe Vector build.
+
+          - source: \`$source_sha\`
+          - features: \`$FEATURES\`
+          - targets: darwin/arm64, linux/arm64, linux/amd64
+
+          Do not retag or overwrite assets.
+          EOF
+          )" \
+            release/*.tar.gz \
+            "release/vector-$version-SHA256SUMS"
